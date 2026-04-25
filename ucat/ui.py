@@ -579,7 +579,39 @@ class App(tk.Tk):
         self._status("Stopping bulk run…")
 
     def _bulk_row_selected(self, _e):
-        pass
+        sel = self._bulk_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        if not iid.startswith("bulk-"):
+            return
+        try:
+            idx = int(iid.split("-", 1)[1])
+        except ValueError:
+            return
+        if idx < 1 or idx > len(self._bulk_rows):
+            return
+
+        row = self._bulk_rows[idx - 1]
+        self._bulk_preview.config(state="normal")
+        self._bulk_preview.delete(1.0, tk.END)
+
+        if row["status"] == "done" and row["result"]:
+            self._bulk_preview.insert(tk.END, format_qset(row["result"]["data"]))
+        elif row["status"] == "failed":
+            err = row["error"] or "(no error message captured)"
+            self._bulk_preview.insert(tk.END,
+                f"Set {idx} failed after retry.\n\n{err}")
+        elif row["status"] == "skipped":
+            self._bulk_preview.insert(tk.END,
+                f"Set {idx} was skipped (Stop pressed before it started).")
+        elif row["status"] == "running":
+            self._bulk_preview.insert(tk.END,
+                f"Set {idx} is still being generated…")
+        else:  # queued
+            self._bulk_preview.insert(tk.END, f"Set {idx} is queued.")
+
+        self._bulk_preview.config(state="disabled")
 
     # ── Bulk worker helpers ───────────────────────────────────────────────────
 
