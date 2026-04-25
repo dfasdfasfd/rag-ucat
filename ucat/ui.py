@@ -552,7 +552,12 @@ class App(tk.Tk):
         self._bulk_thread.start()
 
     def _bulk_stop_clicked(self):
-        pass
+        if self._bulk_thread is None or not self._bulk_thread.is_alive():
+            return
+        self._bulk_stop.set()
+        self._bulk_stop_btn.config(state="disabled")
+        self._bulk_progress_lbl.config(text="Stopping after current set…")
+        self._status("Stopping bulk run…")
 
     def _bulk_row_selected(self, _e):
         pass
@@ -698,6 +703,13 @@ class App(tk.Tk):
         succeeded = 0
         failed    = 0
         for i in range(1, n + 1):
+            if self._bulk_stop.is_set():
+                # Mark this and every later row as skipped, then exit.
+                for j in range(i, n + 1):
+                    self.after(0, lambda idx=j: self._bulk_set_row(idx, status="skipped"))
+                self.after(0, lambda: self._bulk_run_finished(succeeded, failed, stopped=True))
+                return
+
             started_at = datetime.now().strftime("%H:%M:%S")
             self.after(0, lambda idx=i, t=started_at: self._bulk_set_row(
                 idx, status="running", started=t))
