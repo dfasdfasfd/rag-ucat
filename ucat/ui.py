@@ -545,6 +545,25 @@ class App(tk.Tk):
                 return
 
         hint = self._bulk_hint.get()
+
+        # Cost preview + threshold check.
+        llm    = self.settings.get("llm")
+        verify = bool(self.settings.get("verify"))
+        jury   = bool(self.settings.get("multi_judge"))
+        low, high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+
+        if high > BULK_COST_CONFIRM_THRESHOLD:
+            ok = messagebox.askyesno(
+                "Confirm bulk run",
+                f"Estimated cost: ${low:.2f} - ${high:.2f}\n"
+                f"Sets: {n}\n"
+                f"Section: {SECTIONS[section]}\n"
+                f"Model: {llm}\n\n"
+                f"Continue?",
+            )
+            if not ok:
+                return
+
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
             target=self._bulk_worker, args=(section, hint, n), daemon=True
