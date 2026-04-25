@@ -530,6 +530,13 @@ class App(tk.Tk):
                 f"{msg}\n\nCopy .env.example → .env and fill in your keys.")
             return
 
+        if self._bulk_thread is not None and self._bulk_thread.is_alive():
+            self._status("A bulk run is already in progress.")
+            return
+        if str(self._gbtn.cget("state")) == "disabled":
+            self._status("A run is already in progress — wait or stop it first.")
+            return
+
         section = self._bulk_sec.get()
         raw = self._bulk_qty.get().strip()
         if not raw.isdigit():
@@ -944,6 +951,10 @@ class App(tk.Tk):
         self._launch_gen(variation_seed=seed)
 
     def _launch_gen(self, variation_seed: Optional[str]):
+        if self._bulk_thread is not None and self._bulk_thread.is_alive():
+            self._status("A bulk run is in progress — wait or stop it first.")
+            return
+
         ok, msg = api_status()
         if not ok:
             messagebox.showerror("API Not Ready",
@@ -1417,7 +1428,12 @@ class App(tk.Tk):
         self.after(7000, lambda: self._sbar.config(text="Ready"))
 
     def on_close(self):
-        self.db.close(); self.destroy()
+        # Halt any in-flight bulk run; give the worker up to 5s to exit before destroy.
+        if self._bulk_thread is not None and self._bulk_thread.is_alive():
+            self._bulk_stop.set()
+            self._bulk_thread.join(timeout=5.0)
+        self.db.close()
+        self.destroy()
 
 
 def run():
