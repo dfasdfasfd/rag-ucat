@@ -524,13 +524,204 @@ class App(tk.Tk):
             self._bulk_start_btn.config(state="normal")
 
     def _bulk_start(self):
-        pass
+        ok, msg = api_status()
+        if not ok:
+            messagebox.showerror("API Not Ready",
+                f"{msg}\n\nCopy .env.example → .env and fill in your keys.")
+            return
+
+        section = self._bulk_sec.get()
+        raw = self._bulk_qty.get().strip()
+        if not raw.isdigit():
+            return
+        n = min(int(raw), BULK_MAX_QUANTITY)
+        if n < 1:
+            return
+
+        if self.db.count(section, indexed_only=True) == 0:
+            if not messagebox.askyesno("No Indexed Documents",
+                f"No indexed documents for {SECTIONS[section]}.\n\n"
+                "Add docs and click Index, or generate without RAG context?"):
+                return
+
+        hint = self._bulk_hint.get()
+        self._bulk_stop.clear()
+        self._bulk_thread = threading.Thread(
+            target=self._bulk_worker, args=(section, hint, n), daemon=True
+        )
+        self._bulk_thread.start()
 
     def _bulk_stop_clicked(self):
         pass
 
     def _bulk_row_selected(self, _e):
         pass
+
+    # ── Bulk worker helpers ───────────────────────────────────────────────────
+
+    def _bulk_row_iid(self, idx: int) -> str:
+        return f"bulk-{idx}"
+
+    def _bulk_seed_rows(self, n: int):
+        """Initialise _bulk_rows + Treeview with N queued entries."""
+        self._bulk_rows = [{"idx": i, "status": "queued", "result": None,
+                             "error": None, "started": ""} for i in range(1, n + 1)]
+        for iid in self._bulk_tree.get_children():
+            self._bulk_tree.delete(iid)
+        for r in self._bulk_rows:
+            self._bulk_tree.insert(
+                "", "end", iid=self._bulk_row_iid(r["idx"]),
+                values=(r["idx"], "", "queued", "—", "—", "—"),
+            )
+
+    def _bulk_set_row(self, idx: int, *,
+                       status: Optional[str] = None,
+                       result: Optional[Dict[str, Any]] = None,
+                       error:  Optional[str] = None,
+                       started: Optional[str] = None,
+                       progress: Optional[str] = None):
+        """Update an in-memory row + the Treeview cells. Main-thread only."""
+        if idx < 1 or idx > len(self._bulk_rows):
+            return
+        row = self._bulk_rows[idx - 1]
+        if started is not None: row["started"] = started
+        if result  is not None: row["result"]  = result
+        if error   is not None: row["error"]   = error
+        if status  is not None: row["status"]  = status
+
+        # Compute display cells.
+        if status == "running" and progress:
+            st_cell = f"⟳ {progress[:60]}"
+        elif row["status"] == "running":
+            st_cell = "⟳ running"
+        elif row["status"] == "done":
+            st_cell = "✓ done"
+        elif row["status"] == "failed":
+            st_cell = f"✗ {(row['error'] or '')[:60]}"
+        elif row["status"] == "skipped":
+            st_cell = "· skipped"
+        else:  # queued
+            st_cell = "queued"
+
+        verdict_cell = "—"
+        cost_cell    = "—"
+        diff_cell    = "—"
+        if row["result"]:
+            v = row["result"].get("verdict") or {}
+            if not v:
+                verdict_cell = "—"
+            elif v.get("overall_correct", True):
+                fq = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
+                verdict_cell = "✓" if fq == 0 else f"⚠ {fq}"
+            else:
+                fq  = len(v.get("flagged_questions") or [])
+                sym = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
+                verdict_cell = f"⚠ {fq + sym}"
+
+            u = row["result"].get("usage") or {}
+            if u.get("cost_usd") is not None:
+                cost_cell = f"${u['cost_usd']:.3f}"
+
+            cal = row["result"].get("difficulty") or {}
+            sd  = cal.get("set_difficulty")
+            if isinstance(sd, (int, float)):
+                diff_cell = f"{sd:.1f}"
+
+        self._bulk_tree.item(
+            self._bulk_row_iid(idx),
+            values=(idx, row["started"], st_cell, verdict_cell, cost_cell, diff_cell),
+        )
+
+    def _bulk_run_started(self, n: int):
+        self._bulk_started_at = time.perf_counter()
+        self._bulk_run_cost   = 0.0
+        self._bulk_start_btn.config(state="disabled", text="Generating…")
+        self._bulk_stop_btn.config(state="normal")
+        self._bulk_progress_lbl.config(text=f"0 / {n}")
+        self._bulk_seed_rows(n)
+        llm    = self.settings.get("llm")
+        verify = bool(self.settings.get("verify"))
+        jury   = bool(self.settings.get("multi_judge"))
+        _, est_high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+        emit("bulk_run_start",
+             section=self._bulk_sec.get(),
+             n=n,
+             model=llm,
+             verify=verify,
+             multi_judge=jury,
+             estimated_cost_high=round(est_high, 4))
+
+    def _bulk_run_finished(self, succeeded: int, failed: int, stopped: bool = False):
+        n = len(self._bulk_rows)
+        skipped = sum(1 for r in self._bulk_rows if r["status"] == "skipped")
+        elapsed = (time.perf_counter() - (self._bulk_started_at or time.perf_counter()))
+        emit("bulk_run_end",
+             section=self._bulk_sec.get(),
+             n=n,
+             succeeded=succeeded,
+             failed=failed,
+             stopped=stopped,
+             actual_cost_usd=round(self._bulk_run_cost, 4),
+             duration_s=round(elapsed, 1))
+        self._bulk_thread = None
+        self._bulk_started_at = None
+        self._bulk_start_btn.config(state="normal", text="⚡  START BULK RUN")
+        self._bulk_stop_btn.config(state="disabled")
+        if stopped:
+            tail = f"Stopped at {succeeded + failed} / {n}."
+        else:
+            tail = f"Bulk run finished: {succeeded} succeeded, {failed} failed"
+            if skipped: tail += f", {skipped} skipped"
+            tail += "."
+        self._bulk_progress_lbl.config(text=tail)
+        self._status(tail)
+        self._bulk_inputs_changed()  # re-evaluate Start button against new state
+
+    def _bulk_after_success(self, idx: int, result: Dict[str, Any]):
+        """Main-thread; updates row + global session counters + History."""
+        self._bulk_set_row(idx, status="done", result=result)
+        usage = result.get("usage") or {}
+        self._bulk_run_cost += usage.get("cost_usd", 0.0) or 0.0
+        self._session_cost  += usage.get("cost_usd", 0.0) or 0.0
+        self._session_tokens["in"]      += usage.get("input_tokens", 0) or 0
+        self._session_tokens["out"]     += usage.get("output_tokens", 0) or 0
+        self._session_tokens["cache_r"] += usage.get("cache_read_input_tokens", 0) or 0
+        self._session_tokens["cache_w"] += usage.get("cache_creation_input_tokens", 0) or 0
+        tot = sum(self._session_tokens.values())
+        self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._refresh_stats()
+        self._refresh_out()
+        self._refresh_insights()
+
+    def _bulk_worker(self, section: str, hint: str, n: int):
+        self.after(0, lambda: self._bulk_run_started(n))
+        succeeded = 0
+        failed    = 0
+        for i in range(1, n + 1):
+            started_at = datetime.now().strftime("%H:%M:%S")
+            self.after(0, lambda idx=i, t=started_at: self._bulk_set_row(
+                idx, status="running", started=t))
+            self.after(0, lambda idx=i, total=n: self._bulk_progress_lbl.config(
+                text=f"{idx - 1} / {total} — generating set {idx}…"))
+
+            try:
+                result = self.rag.generate(
+                    section, hint,
+                    on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
+                        self._bulk_set_row(_i, status="running", progress=msg)),
+                    on_delta=None,
+                    variation_seed=str(uuid.uuid4())[:8],
+                )
+                self.after(0, lambda idx=i, r=result: self._bulk_after_success(idx, r))
+                succeeded += 1
+            except Exception as e:
+                logger.exception(f"Bulk set {i} failed")
+                err = str(e)
+                self.after(0, lambda idx=i, msg=err: self._bulk_set_row(
+                    idx, status="failed", error=msg))
+                failed += 1
+
+        self.after(0, lambda: self._bulk_run_finished(succeeded, failed))
 
     # ── Knowledge base tab ────────────────────────────────────────────────────
 
