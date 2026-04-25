@@ -476,7 +476,52 @@ class App(tk.Tk):
 
     # Stub methods — bodies filled in by later tasks.
     def _bulk_inputs_changed(self):
-        pass
+        """Called whenever section / quantity / hint changes. Validates input,
+        updates the cost preview banner, persists settings, and gates the Start
+        button."""
+        section = self._bulk_sec.get()
+        hint    = self._bulk_hint.get()
+
+        # Persist settings.
+        self.settings.set("bulk_section", section)
+        self.settings.set("bulk_hint",    hint)
+
+        # Parse quantity.
+        raw = self._bulk_qty.get().strip()
+        n: Optional[int] = None
+        capped = False
+        if raw.isdigit():
+            n = int(raw)
+            if n > BULK_MAX_QUANTITY:
+                n = BULK_MAX_QUANTITY
+                capped = True
+            if n >= 1:
+                self.settings.set("bulk_quantity", n)
+
+        # Update cost banner + Start enable state.
+        if n is None or n < 1:
+            self._bulk_cost_lbl.config(
+                text=f"Enter a number 1 - {BULK_MAX_QUANTITY}.",
+                fg=WARN,
+            )
+            self._bulk_start_btn.config(state="disabled")
+            return
+
+        llm     = self.settings.get("llm")
+        verify  = bool(self.settings.get("verify"))
+        jury    = bool(self.settings.get("multi_judge"))
+        low, high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+
+        suffix = "  (capped at the max — split into multiple runs for more)" if capped else ""
+        self._bulk_cost_lbl.config(
+            text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   "
+                 f"({n} sets × {llm}{suffix})",
+            fg=ACCENT,
+        )
+
+        # Don't override "running" state — we re-enable in _bulk_run_finished.
+        if self._bulk_thread is None or not self._bulk_thread.is_alive():
+            self._bulk_start_btn.config(state="normal")
 
     def _bulk_start(self):
         pass
