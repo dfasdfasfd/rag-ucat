@@ -1,0 +1,1116 @@
+"""Tkinter UI — generation tab, knowledge base browser, output history,
+and insights dashboard for coverage / bias / difficulty.
+"""
+from __future__ import annotations
+
+import io
+import json
+import threading
+import time
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+from .config import (APP_TITLE, LLM_CHOICES, EMBED_CHOICES, SECTIONS, SECTION_COLORS,
+                      DEFAULT_LLM, DEFAULT_EMBED, IRT_BANDS, api_status, Settings,
+                      BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost)
+from .db import Database
+from .format import format_qset
+from .rag import RAGEngine
+from .rendering import render_visuals_for
+from .samples import SAMPLES
+from .telemetry import emit, aggregate, logger
+
+# ─── Theme ────────────────────────────────────────────────────────────────────
+
+BG = "#0C1117"; PANEL = "#161B22"; PANEL2 = "#1C2128"; BORDER = "#30363D"
+ACCENT = "#58A6FF"; TEXT = "#E6EDF3"; MUTED = "#7D8590"
+SUCCESS = "#3FB950"; DANGER = "#F85149"; WARN = "#D29922"
+
+FM = ("Courier New", 11); FB = ("Courier New", 11, "bold")
+FS = ("Courier New", 9);  FSB = ("Courier New", 9, "bold")
+FT = ("Courier New", 15, "bold"); FH = ("Courier New", 10, "bold")
+
+
+def mkbtn(parent, text, cmd, fg="white", bg=ACCENT, font=None, **kw):
+    return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
+                     font=font or FB, relief="flat", cursor="hand2",
+                     activebackground=bg, activeforeground=fg, **kw)
+
+
+# ─── Scrollable frame helper ──────────────────────────────────────────────────
+
+class ScrollFrame(tk.Frame):
+    """A vertically-scrollable Frame for the visuals panel."""
+
+    def __init__(self, parent, bg=PANEL, **kw):
+        super().__init__(parent, bg=bg, **kw)
+        self._canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
+        self._sb = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self._canvas, bg=bg)
+        self._win = self._canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner_resize)
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self._canvas.bind_all("<Button-4>", self._on_btn4, add="+")
+        self._canvas.bind_all("<Button-5>", self._on_btn5, add="+")
+
+    def _on_inner_resize(self, _e):
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_resize(self, e):
+        self._canvas.itemconfigure(self._win, width=e.width)
+
+    def _on_mousewheel(self, e):
+        # Only scroll if pointer is over us.
+        if not str(e.widget).startswith(str(self._canvas)):
+            return
+        delta = -1 if e.delta > 0 else 1
+        self._canvas.yview_scroll(delta, "units")
+
+    def _on_btn4(self, e):
+        if not str(e.widget).startswith(str(self._canvas)):
+            return
+        self._canvas.yview_scroll(-1, "units")
+
+    def _on_btn5(self, e):
+        if not str(e.widget).startswith(str(self._canvas)):
+            return
+        self._canvas.yview_scroll(1, "units")
+
+    def clear(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+
+
+# ─── Application ─────────────────────────────────────────────────────────────
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("1480x960")
+        self.minsize(1180, 760)
+        self.configure(bg=BG)
+
+        self.settings = Settings()
+        self.db       = Database()
+        self.rag      = RAGEngine(self.db, self.settings)
+
+        self._last_data: Optional[Dict[str, Any]] = None
+        self._last_section: Optional[str] = None
+        self._last_retrieved: List = []
+        self._sel_gen_id: Optional[int] = None
+        self._session_cost = 0.0
+        self._session_tokens = {"in": 0, "out": 0, "cache_r": 0, "cache_w": 0}
+        # Keep refs to PhotoImages so Tk doesn't GC them.
+        self._photo_refs: List[Any] = []
+
+        # Bulk-run state.
+        self._bulk_stop: threading.Event = threading.Event()
+        self._bulk_thread: Optional[threading.Thread] = None
+        self._bulk_rows: List[Dict[str, Any]] = []
+        self._bulk_started_at: Optional[float] = None
+        self._bulk_run_cost: float = 0.0  # accumulated USD for the active run
+
+        self._style()
+        self._ui()
+        self.after(700, self._chk_api)
+
+    def _style(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TFrame", background=BG)
+        s.configure("TLabel", background=BG, foreground=TEXT, font=FM)
+        s.configure("TNotebook", background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, font=FM, padding=[18, 9])
+        s.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", ACCENT)])
+        s.configure("Treeview", background=PANEL, foreground=TEXT,
+                    fieldbackground=PANEL, font=FS, rowheight=28, borderwidth=0)
+        s.configure("Treeview.Heading", background=BG, foreground=MUTED, font=FH)
+        s.map("Treeview", background=[("selected", "#1F6FEB")], foreground=[("selected", "white")])
+        s.configure("TScrollbar", background=PANEL, troughcolor=BG, borderwidth=0)
+        s.configure("TCombobox", font=FM)
+        s.configure("TSeparator", background=BORDER)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _ui(self):
+        # Header.
+        hdr = tk.Frame(self, bg=PANEL, height=54)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="◈  UCAT TRAINER", bg=PANEL, fg=ACCENT,
+                 font=("Courier New", 15, "bold")).pack(side="left", padx=22, pady=12)
+        tk.Label(hdr, text="RAG", bg=PANEL, fg=WARN, font=FSB).pack(side="left", pady=12)
+
+        self._cost_lbl = tk.Label(hdr, text="$0.00 · 0 tok", bg=PANEL, fg=MUTED, font=FS)
+        self._cost_lbl.pack(side="right", padx=(0, 22), pady=12)
+        self._dot  = tk.Label(hdr, text="●", bg=PANEL, fg=DANGER, font=("Courier New", 13))
+        self._dlbl = tk.Label(hdr, text="Checking API…", bg=PANEL, fg=MUTED, font=FS)
+        self._dot.pack(side="right", padx=(0, 18))
+        self._dlbl.pack(side="right", padx=(0, 4))
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True)
+        self._sidebar(body)
+
+        self._nb = ttk.Notebook(body)
+        self._nb.pack(side="left", fill="both", expand=True)
+        self._t_gen      = tk.Frame(self._nb, bg=BG)
+        self._t_bulk     = tk.Frame(self._nb, bg=BG)
+        self._t_kb       = tk.Frame(self._nb, bg=BG)
+        self._t_out      = tk.Frame(self._nb, bg=BG)
+        self._t_insights = tk.Frame(self._nb, bg=BG)
+        self._nb.add(self._t_gen,      text="  ⚡  GENERATE  ")
+        self._nb.add(self._t_bulk,     text="  ⚡⚡ BULK  ")
+        self._nb.add(self._t_kb,       text="  🗄  KNOWLEDGE BASE  ")
+        self._nb.add(self._t_out,      text="  📋  HISTORY  ")
+        self._nb.add(self._t_insights, text="  📊  INSIGHTS  ")
+        self._tab_gen()
+        self._tab_bulk()
+        self._tab_kb()
+        self._tab_out()
+        self._tab_insights()
+
+        self._sbar = tk.Label(self, text="Ready", bg="#090C10", fg=MUTED, font=FS, anchor="w")
+        self._sbar.pack(fill="x", padx=12, pady=(2, 4))
+        self._refresh_stats()
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+
+    def _sidebar(self, parent):
+        container = tk.Frame(parent, bg=PANEL, width=250)
+        container.pack(side="left", fill="y"); container.pack_propagate(False)
+        sf = ScrollFrame(container, bg=PANEL)
+        sf.pack(fill="both", expand=True)
+        sb = sf.inner
+
+        tk.Label(sb, text="KNOWLEDGE BASE", bg=PANEL, fg=MUTED,
+                 font=FSB).pack(anchor="w", padx=16, pady=(20, 6))
+        self._slabels: Dict[str, tk.Label] = {}
+        for code in SECTIONS:
+            row = tk.Frame(sb, bg=PANEL)
+            row.pack(fill="x", padx=10, pady=3)
+            tk.Label(row, text="■", bg=PANEL, fg=SECTION_COLORS[code],
+                     font=("Courier New", 12)).pack(side="left", padx=(4, 8))
+            tk.Label(row, text=code, bg=PANEL, fg=TEXT, font=FB).pack(side="left")
+            lbl = tk.Label(row, text="0/0", bg=PANEL, fg=MUTED, font=FS)
+            lbl.pack(side="right", padx=8)
+            self._slabels[code] = lbl
+        tk.Label(sb, text="indexed / total", bg=PANEL, fg=MUTED,
+                 font=("Courier New", 8)).pack(anchor="e", padx=14, pady=(0, 4))
+
+        ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=12, pady=12)
+
+        tk.Label(sb, text="LLM MODEL", bg=PANEL, fg=MUTED, font=FSB).pack(anchor="w", padx=16, pady=(0, 4))
+        self._llm_var = tk.StringVar(value=self.settings.get("llm"))
+        ttk.Combobox(sb, textvariable=self._llm_var, width=22, state="readonly",
+                      values=LLM_CHOICES).pack(padx=14, pady=(0, 8))
+        self._llm_var.trace_add("write", lambda *_: self.settings.set("llm", self._llm_var.get()))
+
+        tk.Label(sb, text="EMBED MODEL", bg=PANEL, fg=MUTED, font=FSB).pack(anchor="w", padx=16, pady=(0, 4))
+        self._emb_var = tk.StringVar(value=self.settings.get("embed"))
+        ttk.Combobox(sb, textvariable=self._emb_var, width=22, state="readonly",
+                      values=EMBED_CHOICES).pack(padx=14, pady=(0, 6))
+        self._emb_var.trace_add("write", lambda *_: self.settings.set("embed", self._emb_var.get()))
+
+        ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=12, pady=10)
+
+        # Top-K.
+        tk.Label(sb, text="CONTEXT DOCS  (TOP-K)", bg=PANEL, fg=MUTED, font=FSB).pack(anchor="w", padx=16)
+        kf = tk.Frame(sb, bg=PANEL); kf.pack(fill="x", padx=14, pady=(2, 4))
+        self._topk_var = tk.IntVar(value=self.settings.get("top_k"))
+        ttk.Scale(kf, from_=1, to=8, variable=self._topk_var, orient="horizontal",
+                   command=lambda _v: (self.settings.set("top_k", int(self._topk_var.get())),
+                                        self._topk_lbl.config(text=str(self._topk_var.get())))
+                   ).pack(side="left", fill="x", expand=True)
+        self._topk_lbl = tk.Label(kf, text=str(self._topk_var.get()), bg=PANEL, fg=TEXT, font=FB, width=2)
+        self._topk_lbl.pack(side="right", padx=(6, 0))
+
+        # MMR λ.
+        tk.Label(sb, text="DIVERSITY  (MMR λ)", bg=PANEL, fg=MUTED, font=FSB).pack(anchor="w", padx=16, pady=(4, 0))
+        mf = tk.Frame(sb, bg=PANEL); mf.pack(fill="x", padx=14, pady=(2, 4))
+        self._mmr_var = tk.DoubleVar(value=self.settings.get("mmr_lambda"))
+        ttk.Scale(mf, from_=0.0, to=1.0, variable=self._mmr_var, orient="horizontal",
+                   command=lambda _v: (self.settings.set("mmr_lambda", round(self._mmr_var.get(), 2)),
+                                        self._mmr_lbl.config(text=f"{self._mmr_var.get():.2f}"))
+                   ).pack(side="left", fill="x", expand=True)
+        self._mmr_lbl = tk.Label(mf, text=f"{self._mmr_var.get():.2f}", bg=PANEL, fg=TEXT, font=FB, width=4)
+        self._mmr_lbl.pack(side="right", padx=(6, 0))
+        tk.Label(sb, text="0=diverse  · 1=relevant", bg=PANEL, fg=MUTED,
+                  font=("Courier New", 8)).pack(anchor="e", padx=16)
+
+        # Difficulty (IRT logits).
+        tk.Label(sb, text="TARGET DIFFICULTY  (IRT logits)", bg=PANEL, fg=MUTED, font=FSB).pack(anchor="w", padx=16, pady=(8, 0))
+        df = tk.Frame(sb, bg=PANEL); df.pack(fill="x", padx=14, pady=(2, 4))
+        self._diff_var = tk.DoubleVar(value=self.settings.get("target_difficulty"))
+        ttk.Scale(df, from_=1.0, to=5.0, variable=self._diff_var, orient="horizontal",
+                   command=lambda _v: (self.settings.set("target_difficulty", round(self._diff_var.get(), 1)),
+                                        self._diff_lbl.config(text=f"{self._diff_var.get():.1f}"))
+                   ).pack(side="left", fill="x", expand=True)
+        self._diff_lbl = tk.Label(df, text=f"{self._diff_var.get():.1f}", bg=PANEL, fg=TEXT, font=FB, width=4)
+        self._diff_lbl.pack(side="right", padx=(6, 0))
+        tk.Label(sb, text="1=easy · 3=medium · 5=very hard", bg=PANEL, fg=MUTED,
+                  font=("Courier New", 8)).pack(anchor="e", padx=16, pady=(0, 4))
+
+        # Verify checkboxes.
+        self._verify_var = tk.BooleanVar(value=self.settings.get("verify"))
+        tk.Checkbutton(sb, text="✓ Self-verify answers",
+                        variable=self._verify_var, bg=PANEL, fg=TEXT, font=FS,
+                        selectcolor=PANEL, activebackground=PANEL, activeforeground=ACCENT,
+                        command=lambda: self.settings.set("verify", self._verify_var.get())
+                        ).pack(anchor="w", padx=14, pady=(4, 0))
+        self._jury_var = tk.BooleanVar(value=self.settings.get("multi_judge"))
+        tk.Checkbutton(sb, text="🏛  3-judge jury",
+                        variable=self._jury_var, bg=PANEL, fg=TEXT, font=FS,
+                        selectcolor=PANEL, activebackground=PANEL, activeforeground=ACCENT,
+                        command=lambda: self.settings.set("multi_judge", self._jury_var.get())
+                        ).pack(anchor="w", padx=14, pady=(0, 4))
+
+        ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=12, pady=8)
+
+        self._idx_btn  = mkbtn(sb, "⊛  Index Knowledge Base", self._do_index,
+                                bg="#1F6FEB", pady=8)
+        self._idx_btn.pack(padx=14, pady=(4, 2), fill="x")
+        self._idx_lbl = tk.Label(sb, text="", bg=PANEL, fg=MUTED, font=FS)
+        self._idx_lbl.pack(padx=14, anchor="w", pady=(0, 8))
+
+        ttk.Separator(sb, orient="horizontal").pack(fill="x", padx=12, pady=4)
+
+        mkbtn(sb, "📥  Import from Crawler", self._import_crawler,
+              bg="#7E5BEF", pady=7).pack(padx=14, pady=3, fill="x")
+        mkbtn(sb, "⊕  Import JSON",   self._import,      bg="#2D7D46", pady=7
+              ).pack(padx=14, pady=3, fill="x")
+        mkbtn(sb, "⊞  Add Samples",   self._add_samples, bg=PANEL, fg=ACCENT,
+              font=FS, pady=6).pack(padx=14, pady=2, fill="x")
+        mkbtn(sb, "↓  Export Output", self._export,      bg=PANEL, fg=MUTED,
+              font=FS, pady=6).pack(padx=14, pady=2, fill="x")
+
+    # ── Generate tab ──────────────────────────────────────────────────────────
+
+    def _tab_gen(self):
+        p = tk.Frame(self._t_gen, bg=BG)
+        p.pack(fill="both", expand=True, padx=24, pady=20)
+
+        tk.Label(p, text="Generate New Questions", bg=BG, fg=TEXT, font=FT).pack(anchor="w")
+        tk.Label(p,
+                 text="MMR-diverse retrieval → cached generation → multi-judge verification → "
+                      "auto-calibrated difficulty → bias / coverage analysis. Visuals render "
+                      "automatically for QR charts, AR shapes, and DM venns.",
+                 bg=BG, fg=MUTED, font=FS, wraplength=1100, justify="left"
+                 ).pack(anchor="w", pady=(2, 14))
+
+        sr = tk.Frame(p, bg=BG); sr.pack(anchor="w", pady=(0, 10))
+        tk.Label(sr, text="Section:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._gsec = tk.StringVar(value="VR")
+        for code in SECTIONS:
+            tk.Radiobutton(sr, text=f" {code} ", variable=self._gsec, value=code,
+                           bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+                           activeforeground=ACCENT, font=FB, indicatoron=False,
+                           relief="flat", bd=1, padx=12, pady=6, cursor="hand2"
+                           ).pack(side="left", padx=4)
+
+        hr = tk.Frame(p, bg=BG); hr.pack(fill="x", pady=(0, 10))
+        tk.Label(hr, text="Topic hint:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._hint = tk.StringVar()
+        tk.Entry(hr, textvariable=self._hint, bg=PANEL2, fg=TEXT, font=FM,
+                 insertbackground=ACCENT, relief="flat", width=46).pack(side="left")
+        tk.Label(hr, text="(steers retrieval — e.g. 'percentage change', 'syllogisms', 'ecology')",
+                 bg=BG, fg=MUTED, font=FS).pack(side="left", padx=10)
+
+        ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
+        self._gbtn  = mkbtn(ar, "⚡  GENERATE QUESTIONS", self._do_gen,
+                             padx=26, pady=10, font=("Courier New", 12, "bold"))
+        self._gbtn.pack(side="left", padx=(0, 12))
+        self._regenbtn = mkbtn(ar, "↻  Regenerate (variation)", self._do_regen,
+                                bg=PANEL, fg=ACCENT, font=FS, padx=14, pady=10, state="disabled")
+        self._regenbtn.pack(side="left", padx=(0, 14))
+        self._gprog = tk.Label(ar, text="", bg=BG, fg=MUTED, font=FS)
+        self._gprog.pack(side="left")
+
+        # Three-column body: text output | visuals | retrieved context
+        cols = tk.Frame(p, bg=BG); cols.pack(fill="both", expand=True)
+
+        # Text output (left).
+        lf = tk.Frame(cols, bg=BG); lf.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        oh = tk.Frame(lf, bg=BG); oh.pack(fill="x")
+        tk.Label(oh, text="OUTPUT", bg=BG, fg=MUTED, font=FH).pack(side="left", pady=(0, 4))
+        self._verdict_lbl = tk.Label(oh, text="", bg=BG, fg=SUCCESS, font=FS)
+        self._verdict_lbl.pack(side="right", pady=(0, 4))
+        ow = tk.Frame(lf, bg=BORDER, bd=1); ow.pack(fill="both", expand=True)
+        self._gout = scrolledtext.ScrolledText(
+            ow, bg=PANEL, fg=TEXT, font=FM, relief="flat",
+            padx=14, pady=12, wrap=tk.WORD, insertbackground=ACCENT, state="disabled"
+        )
+        self._gout.pack(fill="both", expand=True)
+
+        # Visuals (middle).
+        mf = tk.Frame(cols, bg=BG, width=440); mf.pack(side="left", fill="both", padx=(6, 6))
+        mf.pack_propagate(False)
+        vh = tk.Frame(mf, bg=BG); vh.pack(fill="x")
+        tk.Label(vh, text="VISUALS", bg=BG, fg=MUTED, font=FH).pack(side="left", pady=(0, 4))
+        self._vis_status = tk.Label(vh, text="", bg=BG, fg=MUTED, font=FS)
+        self._vis_status.pack(side="right", pady=(0, 4))
+        vw = tk.Frame(mf, bg=BORDER, bd=1); vw.pack(fill="both", expand=True)
+        self._visuals = ScrollFrame(vw, bg=PANEL2)
+        self._visuals.pack(fill="both", expand=True)
+
+        # Retrieved context (right).
+        rf = tk.Frame(cols, bg=BG, width=320); rf.pack(side="right", fill="y", padx=(6, 0))
+        rf.pack_propagate(False)
+        tk.Label(rf, text="RETRIEVED CONTEXT", bg=BG, fg=MUTED, font=FH).pack(anchor="w", pady=(0, 4))
+        cw = tk.Frame(rf, bg=BORDER, bd=1); cw.pack(fill="both", expand=True)
+        self._cout = scrolledtext.ScrolledText(
+            cw, bg=PANEL2, fg=MUTED, font=FS, relief="flat",
+            padx=12, pady=10, wrap=tk.WORD, state="disabled"
+        )
+        self._cout.pack(fill="both", expand=True)
+
+        # Bottom action row.
+        bot = tk.Frame(p, bg=BG); bot.pack(fill="x", pady=(10, 0))
+        self._savebtn = mkbtn(bot, "✓  Save to Knowledge Base", self._save_kb,
+                               bg=SUCCESS, pady=6, padx=14, state="disabled")
+        self._savebtn.pack(side="left", padx=(0, 10))
+        self._copybtn = mkbtn(bot, "⊞  Copy", self._copy,
+                               bg=PANEL, fg=TEXT, font=FM, pady=6, padx=14, state="disabled")
+        self._copybtn.pack(side="left")
+        self._dup_lbl = tk.Label(bot, text="", bg=BG, fg=WARN, font=FS)
+        self._dup_lbl.pack(side="right")
+
+    # ── Bulk tab ──────────────────────────────────────────────────────────────
+
+    def _tab_bulk(self):
+        p = tk.Frame(self._t_bulk, bg=BG)
+        p.pack(fill="both", expand=True, padx=24, pady=20)
+
+        tk.Label(p, text="Bulk Generate", bg=BG, fg=TEXT, font=FT).pack(anchor="w")
+        tk.Label(p,
+                 text="Generate multiple question sets in sequence. Results land "
+                      "in History — promote good ones to the KB from there.",
+                 bg=BG, fg=MUTED, font=FS, wraplength=1100, justify="left"
+                 ).pack(anchor="w", pady=(2, 14))
+
+        # Section radios.
+        sr = tk.Frame(p, bg=BG); sr.pack(anchor="w", pady=(0, 10))
+        tk.Label(sr, text="Section:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._bulk_sec = tk.StringVar(value=self.settings.get("bulk_section"))
+        for code in SECTIONS:
+            tk.Radiobutton(sr, text=f" {code} ", variable=self._bulk_sec, value=code,
+                           bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+                           activeforeground=ACCENT, font=FB, indicatoron=False,
+                           relief="flat", bd=1, padx=12, pady=6, cursor="hand2",
+                           command=self._bulk_inputs_changed
+                           ).pack(side="left", padx=4)
+
+        # Quantity + topic hint row.
+        qr = tk.Frame(p, bg=BG); qr.pack(fill="x", pady=(0, 10))
+        tk.Label(qr, text="Quantity:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._bulk_qty = tk.StringVar(value=str(self.settings.get("bulk_quantity")))
+        tk.Entry(qr, textvariable=self._bulk_qty, bg=PANEL2, fg=TEXT, font=FM,
+                 insertbackground=ACCENT, relief="flat", width=6).pack(side="left")
+        self._bulk_qty.trace_add("write", lambda *_: self._bulk_inputs_changed())
+
+        tk.Label(qr, text="   Topic hint:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(20, 14))
+        self._bulk_hint = tk.StringVar(value=self.settings.get("bulk_hint"))
+        tk.Entry(qr, textvariable=self._bulk_hint, bg=PANEL2, fg=TEXT, font=FM,
+                 insertbackground=ACCENT, relief="flat", width=46).pack(side="left", fill="x", expand=True)
+        self._bulk_hint.trace_add("write", lambda *_: self._bulk_inputs_changed())
+
+        # Cost preview banner.
+        self._bulk_cost_lbl = tk.Label(
+            p, text="", bg=BG, fg=ACCENT, font=FB, anchor="w"
+        )
+        self._bulk_cost_lbl.pack(anchor="w", pady=(2, 12))
+
+        # Action row.
+        ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
+        self._bulk_start_btn = mkbtn(
+            ar, "⚡  START BULK RUN", self._bulk_start,
+            padx=22, pady=10, font=("Courier New", 12, "bold")
+        )
+        self._bulk_start_btn.pack(side="left", padx=(0, 12))
+        self._bulk_stop_btn = mkbtn(
+            ar, "⏹  STOP", self._bulk_stop_clicked,
+            bg=DANGER, padx=18, pady=10, state="disabled"
+        )
+        self._bulk_stop_btn.pack(side="left", padx=(0, 14))
+        self._bulk_progress_lbl = tk.Label(ar, text="", bg=BG, fg=MUTED, font=FS)
+        self._bulk_progress_lbl.pack(side="left")
+
+        # Treeview of per-set rows.
+        tf = tk.Frame(p, bg=BG); tf.pack(fill="both", expand=True, pady=(8, 0))
+        cols = ("#", "Started", "Status", "Verdict", "Cost", "Difficulty")
+        self._bulk_tree = ttk.Treeview(tf, columns=cols, show="headings", height=10)
+        for c, w in zip(cols, (44, 90, 180, 100, 70, 80)):
+            self._bulk_tree.heading(c, text=c)
+            self._bulk_tree.column(c, width=w, anchor="w" if c == "Status" else "center")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self._bulk_tree.yview)
+        self._bulk_tree.configure(yscrollcommand=vsb.set)
+        self._bulk_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._bulk_tree.bind("<<TreeviewSelect>>", self._bulk_row_selected)
+
+        # Preview pane.
+        pf = tk.Frame(p, bg=BORDER); pf.pack(fill="both", expand=True, pady=(8, 0))
+        self._bulk_preview = scrolledtext.ScrolledText(
+            pf, bg=PANEL, fg=TEXT, font=FS, relief="flat",
+            padx=12, pady=10, wrap=tk.WORD, height=8
+        )
+        self._bulk_preview.pack(fill="both", expand=True)
+        self._bulk_preview.config(state="disabled")
+
+        # Initialise the cost banner.
+        self._bulk_inputs_changed()
+
+    # Stub methods — bodies filled in by later tasks.
+    def _bulk_inputs_changed(self):
+        pass
+
+    def _bulk_start(self):
+        pass
+
+    def _bulk_stop_clicked(self):
+        pass
+
+    def _bulk_row_selected(self, _e):
+        pass
+
+    # ── Knowledge base tab ────────────────────────────────────────────────────
+
+    def _tab_kb(self):
+        top = tk.Frame(self._t_kb, bg=BG); top.pack(fill="x", padx=22, pady=(16, 6))
+        tk.Label(top, text="Knowledge Base", bg=BG, fg=TEXT, font=FT).pack(side="left")
+
+        fr = tk.Frame(top, bg=BG); fr.pack(side="right")
+        tk.Label(fr, text="Filter:", bg=BG, fg=MUTED, font=FS).pack(side="left", padx=(0, 8))
+        self._kbf = tk.StringVar(value="ALL")
+        for v in ["ALL"] + list(SECTIONS.keys()):
+            tk.Radiobutton(fr, text=v, variable=self._kbf, value=v,
+                           bg=BG, fg=MUTED, selectcolor=PANEL, activebackground=BG,
+                           font=FS, cursor="hand2", command=self._refresh_kb
+                           ).pack(side="left", padx=3)
+
+        tf = tk.Frame(self._t_kb, bg=BG); tf.pack(fill="both", expand=True, padx=22, pady=(0, 4))
+        cols = ("ID", "Sec", "Source", "Qs", "Indexed", "Date")
+        self._kbt = ttk.Treeview(tf, columns=cols, show="headings", height=14)
+        for c, w in zip(cols, (44, 54, 100, 40, 74, 150)):
+            self._kbt.heading(c, text=c)
+            self._kbt.column(c, width=w, anchor="w" if c == "Date" else "center")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self._kbt.yview)
+        self._kbt.configure(yscrollcommand=vsb.set)
+        self._kbt.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._kbt.bind("<<TreeviewSelect>>", self._kb_sel)
+
+        pf = tk.Frame(self._t_kb, bg=BORDER); pf.pack(fill="both", expand=True, padx=22, pady=(0, 14))
+        self._kbprev = scrolledtext.ScrolledText(
+            pf, bg=PANEL, fg=TEXT, font=FS, relief="flat", padx=12, pady=10, wrap=tk.WORD, height=10
+        )
+        self._kbprev.pack(fill="both", expand=True)
+        self._refresh_kb()
+
+    # ── History tab ───────────────────────────────────────────────────────────
+
+    def _tab_out(self):
+        top = tk.Frame(self._t_out, bg=BG); top.pack(fill="x", padx=22, pady=(16, 6))
+        tk.Label(top, text="Output History", bg=BG, fg=TEXT, font=FT).pack(side="left")
+        mkbtn(top, "↻  Refresh", self._refresh_out, bg=PANEL, fg=MUTED, font=FS, pady=5
+              ).pack(side="right")
+
+        tf = tk.Frame(self._t_out, bg=BG); tf.pack(fill="both", expand=True, padx=22, pady=(0, 4))
+        cols = ("ID", "Section", "Diff", "Cost", "Verdict", "Generated At")
+        self._outt = ttk.Treeview(tf, columns=cols, show="headings", height=10)
+        for c, w in zip(cols, (50, 170, 60, 80, 110, 160)):
+            self._outt.heading(c, text=c)
+            self._outt.column(c, width=w, anchor="w" if c == "Generated At" else "center")
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self._outt.yview)
+        self._outt.configure(yscrollcommand=vsb.set)
+        self._outt.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._outt.bind("<<TreeviewSelect>>", self._out_sel)
+
+        pf = tk.Frame(self._t_out, bg=BORDER); pf.pack(fill="both", expand=True, padx=22, pady=(0, 4))
+        self._outprev = scrolledtext.ScrolledText(
+            pf, bg=PANEL, fg=TEXT, font=FS, relief="flat", padx=12, pady=10, wrap=tk.WORD
+        )
+        self._outprev.pack(fill="both", expand=True)
+
+        bot = tk.Frame(self._t_out, bg=BG); bot.pack(fill="x", padx=22, pady=(0, 10))
+        self._promobtn = mkbtn(bot, "✓  Add to Knowledge Base", self._promote,
+                                bg=SUCCESS, pady=6, padx=14, state="disabled")
+        self._promobtn.pack(side="left")
+        self._refresh_out()
+
+    # ── Insights tab ──────────────────────────────────────────────────────────
+
+    def _tab_insights(self):
+        top = tk.Frame(self._t_insights, bg=BG); top.pack(fill="x", padx=22, pady=(16, 6))
+        tk.Label(top, text="Coverage · Bias · Telemetry", bg=BG, fg=TEXT, font=FT).pack(side="left")
+        mkbtn(top, "↻  Refresh", self._refresh_insights, bg=PANEL, fg=MUTED, font=FS, pady=5
+              ).pack(side="right")
+
+        body = tk.Frame(self._t_insights, bg=BG); body.pack(fill="both", expand=True, padx=22, pady=(0, 14))
+
+        # Two columns.
+        left  = tk.Frame(body, bg=BG); left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = tk.Frame(body, bg=BG); right.pack(side="right", fill="both", expand=True, padx=(8, 0))
+
+        tk.Label(left, text="COVERAGE / BIAS",  bg=BG, fg=MUTED, font=FH).pack(anchor="w", pady=(0, 4))
+        self._cov_box = scrolledtext.ScrolledText(left, bg=PANEL, fg=TEXT, font=FS,
+                                                    relief="flat", padx=12, pady=10,
+                                                    wrap=tk.WORD)
+        self._cov_box.pack(fill="both", expand=True)
+
+        tk.Label(right, text="TELEMETRY",       bg=BG, fg=MUTED, font=FH).pack(anchor="w", pady=(0, 4))
+        self._tel_box = scrolledtext.ScrolledText(right, bg=PANEL, fg=TEXT, font=FS,
+                                                    relief="flat", padx=12, pady=10,
+                                                    wrap=tk.WORD)
+        self._tel_box.pack(fill="both", expand=True)
+
+        self._refresh_insights()
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _chk_api(self):
+        ok, msg = api_status()
+        if ok:
+            self._dot.config(fg=SUCCESS); self._dlbl.config(text="Claude + Voyage ✓", fg=SUCCESS)
+        else:
+            self._dot.config(fg=DANGER); self._dlbl.config(text=msg, fg=DANGER)
+            self._status(f"⚠  {msg}  |  see .env.example for setup")
+
+    def _do_index(self):
+        self._idx_btn.config(state="disabled", text="Indexing…")
+
+        def worker():
+            total = len(self.db.get_unindexed())
+            if total == 0:
+                self.after(0, lambda: (
+                    self._idx_lbl.config(text="Nothing to index"),
+                    self._idx_btn.config(state="normal", text="⊛  Index Knowledge Base"),
+                    self._status("All documents already indexed")
+                ))
+                return
+            try:
+                def prog(done, n):
+                    self.after(0, lambda _d=done, _n=n: (
+                        self._idx_lbl.config(text=f"{_d}/{_n}…"),
+                        self._refresh_stats()
+                    ))
+                done = self.rag.index_all(on_progress=prog)
+                self.after(0, lambda: (
+                    self._idx_lbl.config(text=f"✓ {done} indexed"),
+                    self._idx_btn.config(state="normal", text="⊛  Index Knowledge Base"),
+                    self._refresh_stats(), self._refresh_kb(),
+                    self._status(f"Indexed {done} document(s) (batched)")
+                ))
+            except Exception as e:
+                logger.exception("Index error")
+                self.after(0, lambda err=str(e): (
+                    self._idx_lbl.config(text="Error"),
+                    self._idx_btn.config(state="normal", text="⊛  Index Knowledge Base"),
+                    self._status(f"Index error: {err[:100]}")
+                ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _do_gen(self):
+        self._launch_gen(variation_seed=None)
+
+    def _do_regen(self):
+        seed = datetime.now().strftime("%H%M%S-%f")
+        self._launch_gen(variation_seed=seed)
+
+    def _launch_gen(self, variation_seed: Optional[str]):
+        ok, msg = api_status()
+        if not ok:
+            messagebox.showerror("API Not Ready",
+                f"{msg}\n\nCopy .env.example → .env and fill in your keys.")
+            return
+
+        section = self._gsec.get()
+        if self.db.count(section, indexed_only=True) == 0:
+            if not messagebox.askyesno("No Indexed Documents",
+                f"No indexed documents for {SECTIONS[section]}.\n\n"
+                "Add docs and click Index, or generate without RAG context?"):
+                return
+
+        hint = self._hint.get()
+        self._last_section = section
+
+        self._gbtn.config(state="disabled", text="Generating…")
+        self._regenbtn.config(state="disabled")
+        self._savebtn.config(state="disabled"); self._copybtn.config(state="disabled")
+        self._gprog.config(text="")
+        self._verdict_lbl.config(text="", fg=SUCCESS)
+        self._dup_lbl.config(text="")
+        self._wout("Contacting Claude…\n", self._gout)
+        self._wout("", self._cout)
+        self._clear_visuals()
+        self._stream_buf: List[str] = []
+
+        def on_delta(text: str):
+            self._stream_buf.append(text)
+            self.after(0, lambda: self._set_streaming("".join(self._stream_buf)))
+
+        def worker():
+            try:
+                result = self.rag.generate(
+                    section, hint,
+                    on_progress=lambda m: self.after(0, lambda msg=m: self._gprog.config(text=f"⟳  {msg}")),
+                    on_delta=on_delta,
+                    variation_seed=variation_seed,
+                )
+                self.after(0, lambda: self._gen_ok(result, section))
+            except Exception as e:
+                logger.exception("Generation failed")
+                self.after(0, lambda err=str(e): self._gen_err(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_streaming(self, text: str):
+        self._wout(f"⟳  Streaming…\n\n{text[:4000]}", self._gout)
+
+    def _gen_ok(self, result: Dict[str, Any], section: str):
+        data       = result["data"]
+        retrieved  = result["retrieved"]
+        usage      = result["usage"]
+        verdict    = result["verdict"]
+        coverage   = result["coverage"]
+        difficulty = result["difficulty"]
+        dup        = result["dup_warning"]
+
+        self._last_data = data
+        self._last_section = section
+        self._last_retrieved = retrieved
+
+        self._wout(format_qset(data), self._gout)
+        self._render_visuals(data)
+
+        # Retrieved context panel.
+        ctx_lines = [f"Retrieved {len(retrieved)} doc(s) (MMR λ={self.rag.mmr_lambda}):", ""]
+        for i, (sc, doc) in enumerate(retrieved, 1):
+            ctx_lines.append(f"[{i}] ID #{doc['id']}  ·  {doc['section']}  ·  sim {sc:.3f}  ·  {doc['source']}")
+            ctx_lines.append(f"    {doc['embed_text'][:120].replace(chr(10),' ')}…")
+            ctx_lines.append("")
+        if difficulty:
+            ctx_lines.append("─" * 36)
+            ctx_lines.append(f"Difficulty (calibrated): {difficulty.get('set_difficulty')}")
+            ctx_lines.append(f"  range: {difficulty.get('min')} → {difficulty.get('max')}")
+        if coverage:
+            ctx_lines.append("─" * 36)
+            tc = coverage.get("topic_counts", {})
+            sc_ = coverage.get("scenario_counts", {})
+            if tc: ctx_lines.append(f"Topics: {dict(tc)}")
+            if sc_: ctx_lines.append(f"Scenarios: {dict(sc_)}")
+            for f in coverage.get("flags", []):
+                ctx_lines.append(f"⚠ {f}")
+        if usage:
+            ctx_lines.append("─" * 36)
+            ctx_lines.append(f"Tokens: in {usage['input_tokens']} · out {usage['output_tokens']}")
+            ctx_lines.append(f"Cache: read {usage['cache_read_input_tokens']} · "
+                              f"write {usage['cache_creation_input_tokens']}")
+            ctx_lines.append(f"Cost: ${usage['cost_usd']:.4f}")
+        self._wout("\n".join(ctx_lines).strip(), self._cout)
+
+        # Verdict badge.
+        if verdict:
+            ok = verdict.get("overall_correct", True)
+            mode = verdict.get("mode", "?")
+            sym = verdict.get("symbolic_qr") or {}
+            disagreed = len(sym.get("disagreed", []))
+            if ok and disagreed == 0:
+                conf = verdict.get("confidence", "—") if mode == "single" else (
+                    "unanimous" if verdict.get("unanimous") else "majority")
+                self._verdict_lbl.config(text=f"✓ verified ({mode} · {conf})", fg=SUCCESS)
+            else:
+                bits = []
+                fq = verdict.get("flagged_questions", [])
+                if fq: bits.append(f"{len(fq)} flagged")
+                if disagreed: bits.append(f"{disagreed} arithmetic mismatch")
+                self._verdict_lbl.config(text=f"⚠ {', '.join(bits) or 'issues'}", fg=DANGER)
+
+        if dup:
+            self._dup_lbl.config(text=f"⚠ {dup}", fg=WARN)
+
+        # Session totals.
+        if usage:
+            self._session_cost += usage.get("cost_usd", 0) or 0
+            self._session_tokens["in"]      += usage.get("input_tokens", 0) or 0
+            self._session_tokens["out"]     += usage.get("output_tokens", 0) or 0
+            self._session_tokens["cache_r"] += usage.get("cache_read_input_tokens", 0) or 0
+            self._session_tokens["cache_w"] += usage.get("cache_creation_input_tokens", 0) or 0
+            tot = sum(self._session_tokens.values())
+            self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+
+        self._gbtn.config(state="normal", text="⚡  GENERATE QUESTIONS")
+        self._regenbtn.config(state="normal")
+        self._savebtn.config(state="normal"); self._copybtn.config(state="normal")
+        self._gprog.config(text="✓  Done!")
+        self._refresh_stats(); self._refresh_out(); self._refresh_insights()
+        self._status(f"Generated {SECTIONS[section]} using {len(retrieved)} context doc(s)")
+
+    def _gen_err(self, err: str):
+        self._wout(f"ERROR\n{'─'*40}\n{err}", self._gout)
+        self._gbtn.config(state="normal", text="⚡  GENERATE QUESTIONS")
+        self._regenbtn.config(state="disabled")
+        self._gprog.config(text="")
+        self._verdict_lbl.config(text="")
+        self._status(f"Error: {err[:80]}")
+
+    # ── Visuals rendering helpers ─────────────────────────────────────────────
+
+    def _clear_visuals(self):
+        self._photo_refs.clear()
+        self._visuals.clear()
+        self._vis_status.config(text="")
+
+    def _add_image_to_visuals(self, image, label: str = ""):
+        if image is None or not _HAS_PIL:
+            return
+        if label:
+            tk.Label(self._visuals.inner, text=label, bg=PANEL2, fg=ACCENT,
+                      font=FH).pack(anchor="w", padx=10, pady=(10, 2))
+        # Resize if too wide for the panel.
+        canvas_width = self._visuals.winfo_width() or 420
+        max_w = max(canvas_width - 30, 200)
+        if hasattr(image, "size"):
+            w, h = image.size
+            if w > max_w:
+                ratio = max_w / w
+                new_size = (int(w * ratio), int(h * ratio))
+                image = image.resize(new_size, Image.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        self._photo_refs.append(photo)
+        lbl = tk.Label(self._visuals.inner, image=photo, bg=PANEL2)
+        lbl.pack(padx=10, pady=4)
+
+    def _render_visuals(self, data: Dict[str, Any]):
+        self._clear_visuals()
+        if not _HAS_PIL:
+            tk.Label(self._visuals.inner,
+                      text="(install Pillow for visuals)",
+                      bg=PANEL2, fg=MUTED, font=FS).pack(padx=10, pady=10)
+            return
+
+        try:
+            visuals = render_visuals_for(data)
+        except Exception as e:
+            logger.exception("Visual render failed")
+            tk.Label(self._visuals.inner, text=f"render error: {e}",
+                      bg=PANEL2, fg=DANGER, font=FS).pack(padx=10, pady=10)
+            return
+
+        section = data.get("section")
+        any_added = False
+
+        if section == "QR" and "chart" in visuals:
+            self._add_image_to_visuals(visuals["chart"], label="QR Stimulus Chart")
+            any_added = True
+
+        if section == "AR":
+            if "set_a" in visuals:
+                self._add_image_to_visuals(visuals["set_a"], label="Set A Panels")
+                any_added = True
+            if "set_b" in visuals:
+                self._add_image_to_visuals(visuals["set_b"], label="Set B Panels")
+                any_added = True
+            for i, img in enumerate(visuals.get("tests") or []):
+                self._add_image_to_visuals(img, label=f"Test Shape {i + 1}")
+                any_added = True
+
+        if section == "DM" and "venns" in visuals:
+            for n, img in sorted(visuals["venns"].items()):
+                self._add_image_to_visuals(img, label=f"Q{n} — Venn")
+                any_added = True
+
+        if not any_added:
+            tk.Label(self._visuals.inner,
+                      text=f"(no visuals for {SECTIONS.get(section, section)})",
+                      bg=PANEL2, fg=MUTED, font=FS).pack(padx=10, pady=10)
+        else:
+            self._vis_status.config(text=f"{len(self._photo_refs)} image(s)")
+
+    def _wout(self, text: str, widget):
+        widget.config(state="normal"); widget.delete(1.0, tk.END)
+        widget.insert(tk.END, text); widget.config(state="disabled")
+
+    # ── KB / history / insights actions ──────────────────────────────────────
+
+    def _save_kb(self):
+        if self._last_data and self._last_section:
+            self.db.add_doc(self._last_section, self._last_data, source="generated")
+            self._refresh_stats(); self._refresh_kb()
+            self._gprog.config(text="✓  Saved — re-index to activate for RAG")
+            self._savebtn.config(state="disabled")
+            emit("kb_promote", section=self._last_section)
+
+    def _copy(self):
+        self._gout.config(state="normal")
+        t = self._gout.get(1.0, tk.END)
+        self._gout.config(state="disabled")
+        self.clipboard_clear(); self.clipboard_append(t)
+        self._copybtn.config(text="✓  Copied!")
+        self.after(2000, lambda: self._copybtn.config(text="⊞  Copy"))
+
+    def _import(self):
+        p = filedialog.askopenfilename(
+            title="Import UCAT Questions (JSON)",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")]
+        )
+        if not p: return
+        try:
+            n = self.db.import_json(p)
+            messagebox.showinfo("Import", f"Imported {n} document(s).\nNow click '⊛ Index Knowledge Base'.")
+            self._refresh_stats(); self._refresh_kb()
+        except Exception as e:
+            messagebox.showerror("Import Error", str(e))
+
+    def _import_crawler(self):
+        """Import a folder of crawler-captured questions (manifest.json + per-Q artifacts)."""
+        p = filedialog.askdirectory(
+            title="Select Crawler output folder (the one containing manifest.json)",
+            mustexist=True,
+        )
+        if not p: return
+        from pathlib import Path
+        from .crawler_import import import_from_crawler
+
+        def worker():
+            try:
+                result = import_from_crawler(self.db, Path(p))
+                self.after(0, lambda: self._crawler_import_done(result))
+            except Exception as e:
+                logger.exception("Crawler import failed")
+                self.after(0, lambda err=str(e): messagebox.showerror("Crawler Import Error", err))
+
+        self._status("Importing from crawler…")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _crawler_import_done(self, result: Dict[str, Any]):
+        c = result["counts"]
+        lines = [
+            f"Imported {result['total']} question set(s):",
+            "",
+            f"  VR:   {c['VR']} sets",
+            f"  DM:   {c['DM']} sets",
+            f"  QR:   {c['QR']} sets",
+            f"  SJT:  {c['SJT']} sets",
+        ]
+        if result.get("ar_skipped"):
+            lines.append(f"\n  AR:   {result['ar_skipped']} captures skipped (UCAT removed AR)")
+        if result.get("skipped"):
+            lines.append("")
+            lines.append(f"  {len(result['skipped'])} group(s) had captures dropped:")
+            for s in result["skipped"][:5]:
+                lines.append(f"    • {s['bucket']} ({s['section']}): {s['reason']}")
+            if len(result["skipped"]) > 5:
+                lines.append(f"    … and {len(result['skipped']) - 5} more")
+        if result.get("errors"):
+            lines.append("")
+            lines.append(f"  {len(result['errors'])} error(s):")
+            for err in result["errors"][:3]:
+                lines.append(f"    • {err[:120]}")
+        lines.append("")
+        lines.append("Now click '⊛ Index Knowledge Base' to embed them.")
+        messagebox.showinfo("Crawler Import", "\n".join(lines))
+        self._refresh_stats(); self._refresh_kb()
+        self._status(f"Crawler import: {result['total']} sets added")
+
+    def _add_samples(self):
+        for q in SAMPLES:
+            self.db.add_doc(q["section"], q, source="sample")
+        messagebox.showinfo("Samples Added",
+            f"Added {len(SAMPLES)} sample documents.\nNow click '⊛ Index Knowledge Base'.")
+        self._refresh_stats(); self._refresh_kb()
+
+    def _export(self):
+        rows = self.db.get_generated(limit=10000)
+        if not rows:
+            messagebox.showinfo("Export", "No generated questions yet."); return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("JSON", "*.json")],
+            initialfile="ucat_generated.json"
+        )
+        if p:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump([r["data"] for r in rows], f, indent=2, ensure_ascii=False)
+            messagebox.showinfo("Exported", f"Saved {len(rows)} sets to:\n{p}")
+
+    def _refresh_kb(self):
+        filt = self._kbf.get()
+        docs = self.db.get_all_docs(None if filt == "ALL" else filt, limit=2000)
+        for iid in self._kbt.get_children(): self._kbt.delete(iid)
+        for d in docs:
+            self._kbt.insert("", "end", iid=str(d["id"]),
+                              values=(d["id"], d["section"], d["source"],
+                                      len(d["data"].get("questions", [])),
+                                      "✓" if d["embedding"] else "○",
+                                      d["created"][:16]))
+
+    def _kb_sel(self, _e):
+        sel = self._kbt.selection()
+        if not sel: return
+        docs = self.db.get_all_docs(limit=100000)
+        doc  = next((d for d in docs if d["id"] == int(sel[0])), None)
+        if doc:
+            self._kbprev.config(state="normal")
+            self._kbprev.delete(1.0, tk.END)
+            self._kbprev.insert(tk.END, format_qset(doc["data"]))
+            self._kbprev.config(state="disabled")
+
+    def _refresh_out(self):
+        rows = self.db.get_generated(limit=500)
+        for iid in self._outt.get_children(): self._outt.delete(iid)
+        for r in rows:
+            cost = f"${r['usage']['cost_usd']:.3f}" if r.get("usage") else "—"
+            d = r.get("difficulty")
+            d_str = f"{d:.1f}" if isinstance(d, (int, float)) else "—"
+            v = r.get("verdict") or {}
+            if not v:
+                badge = "—"
+            elif v.get("overall_correct", True):
+                badge = "✓"
+            else:
+                fq = len(v.get("flagged_questions") or [])
+                sym = (v.get("symbolic_qr") or {}).get("disagreed") or []
+                badge = f"⚠ {fq + len(sym)}"
+            self._outt.insert("", "end", iid=str(r["id"]),
+                               values=(r["id"], SECTIONS.get(r["section"], r["section"]),
+                                       d_str, cost, badge,
+                                       (r["created"] or "")[:16]))
+
+    def _out_sel(self, _e):
+        sel = self._outt.selection()
+        if not sel: return
+        self._sel_gen_id = int(sel[0])
+        rows = self.db.get_generated(limit=500)
+        row  = next((r for r in rows if r["id"] == self._sel_gen_id), None)
+        if not row: return
+
+        text = format_qset(row["data"])
+        v = row.get("verdict") or {}
+        if v and not v.get("overall_correct", True):
+            text += "\n\n" + "─" * 40 + "\n⚠  VERDICT FLAGGED:\n"
+            for fq in v.get("flagged_questions") or []:
+                text += f"  • Q{fq} marked incorrect by majority\n"
+            for d in (v.get("symbolic_qr") or {}).get("disagreed") or []:
+                text += (f"  • Q{d['number']}: marked {d['marked_value']} but "
+                          f"explanation computes {d['computed_value']}\n")
+        c = row.get("coverage") or {}
+        if c.get("flags"):
+            text += "\n" + "─" * 40 + "\nCOVERAGE FLAGS:\n"
+            for f in c["flags"]:
+                text += f"  • {f}\n"
+        u = row.get("usage")
+        if u:
+            text += (f"\n{'─'*40}\nUsage: in {u['input_tokens']}  ·  out {u['output_tokens']}  ·  "
+                     f"cache_r {u['cache_read_input_tokens']}  ·  cost ${u['cost_usd']:.4f}\n")
+        self._outprev.config(state="normal")
+        self._outprev.delete(1.0, tk.END)
+        self._outprev.insert(tk.END, text)
+        self._outprev.config(state="disabled")
+        self._promobtn.config(state="normal")
+
+    def _promote(self):
+        if self._sel_gen_id:
+            self.db.promote_to_kb(self._sel_gen_id)
+            self._refresh_stats(); self._refresh_kb()
+            self._promobtn.config(state="disabled")
+            self._status("Added to knowledge base — re-index to activate for RAG")
+
+    def _refresh_stats(self):
+        for code in SECTIONS:
+            idx = self.db.count(code, indexed_only=True)
+            tot = self.db.count(code, indexed_only=False)
+            self._slabels[code].config(text=f"{idx}/{tot}")
+
+    def _refresh_insights(self):
+        # Coverage / bias.
+        rows = self.db.get_generated(limit=500)
+        from .coverage import aggregate_history
+        agg = aggregate_history(rows)
+        cov_lines = [f"Generated runs: {agg['rows']}", "",
+                      "By section:"]
+        for sec, n in sorted(agg.get("sections", {}).items()):
+            cov_lines.append(f"  {sec}: {n}")
+        if agg.get("topics"):
+            cov_lines.append(""); cov_lines.append("Top topics:")
+            for t, n in sorted(agg["topics"].items(), key=lambda x: -x[1])[:25]:
+                cov_lines.append(f"  {t:<30s}  {n}")
+        if agg.get("scenarios"):
+            cov_lines.append(""); cov_lines.append("Scenarios:")
+            for s, n in sorted(agg["scenarios"].items(), key=lambda x: -x[1]):
+                cov_lines.append(f"  {s:<20s}  {n}")
+        if agg.get("flag_counts"):
+            cov_lines.append(""); cov_lines.append("Bias / coverage flags raised:")
+            for f, n in sorted(agg["flag_counts"].items(), key=lambda x: -x[1]):
+                cov_lines.append(f"  ({n}×) {f}")
+        if agg.get("gaps"):
+            cov_lines.append(""); cov_lines.append("Gap warnings:")
+            for g in agg["gaps"]:
+                cov_lines.append(f"  • {g}")
+        # Difficulty distribution.
+        diffs = [r["difficulty"] for r in rows if r.get("difficulty") is not None]
+        if diffs:
+            cov_lines.append(""); cov_lines.append("Difficulty (calibrated):")
+            cov_lines.append(f"  count {len(diffs)}  ·  mean {sum(diffs)/len(diffs):.2f}"
+                              f"  ·  range {min(diffs):.1f}–{max(diffs):.1f}")
+            buckets = [0] * 5
+            for d in diffs:
+                b = min(int(d) - 1, 4)
+                if b < 0: b = 0
+                buckets[b] += 1
+            for i, n in enumerate(buckets, 1):
+                bar = "█" * min(n, 40)
+                cov_lines.append(f"  {i:.1f}–{i+1:.1f}  {bar}  ({n})")
+
+        self._cov_box.config(state="normal")
+        self._cov_box.delete(1.0, tk.END)
+        self._cov_box.insert(tk.END, "\n".join(cov_lines))
+        self._cov_box.config(state="disabled")
+
+        # Telemetry summary.
+        agg_t = aggregate(last_n=2000)
+        tel_lines = [f"Events tracked: {agg_t.get('events', 0)}", ""]
+        if agg_t.get("by_event"):
+            tel_lines.append("By event type:")
+            for e, n in sorted(agg_t["by_event"].items(), key=lambda x: -x[1]):
+                tel_lines.append(f"  {e:<32s} {n}")
+        if agg_t.get("tokens"):
+            t = agg_t["tokens"]
+            tel_lines.append(""); tel_lines.append("Tokens:")
+            tel_lines.append(f"  input        {t['in']:>10,}")
+            tel_lines.append(f"  output       {t['out']:>10,}")
+            tel_lines.append(f"  cache read   {t['cache_read']:>10,}")
+            tel_lines.append(f"  cache write  {t['cache_write']:>10,}")
+        tel_lines.append(""); tel_lines.append(f"Total cost: ${agg_t.get('total_cost_usd', 0):.4f}")
+        self._tel_box.config(state="normal")
+        self._tel_box.delete(1.0, tk.END)
+        self._tel_box.insert(tk.END, "\n".join(tel_lines))
+        self._tel_box.config(state="disabled")
+
+    def _status(self, msg: str):
+        self._sbar.config(text=msg)
+        self.after(7000, lambda: self._sbar.config(text="Ready"))
+
+    def on_close(self):
+        self.db.close(); self.destroy()
+
+
+def run():
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
