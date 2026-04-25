@@ -704,22 +704,33 @@ class App(tk.Tk):
             self.after(0, lambda idx=i, total=n: self._bulk_progress_lbl.config(
                 text=f"{idx - 1} / {total} — generating set {idx}…"))
 
-            try:
-                result = self.rag.generate(
-                    section, hint,
-                    on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
-                        self._bulk_set_row(_i, status="running", progress=msg)),
-                    on_delta=None,
-                    variation_seed=str(uuid.uuid4())[:8],
-                )
-                self.after(0, lambda idx=i, r=result: self._bulk_after_success(idx, r))
-                succeeded += 1
-            except Exception as e:
-                logger.exception(f"Bulk set {i} failed")
-                err = str(e)
-                self.after(0, lambda idx=i, msg=err: self._bulk_set_row(
-                    idx, status="failed", error=msg))
-                failed += 1
+            attempts = 0
+            done = False
+            while attempts < 2 and not done:
+                try:
+                    result = self.rag.generate(
+                        section, hint,
+                        on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
+                            self._bulk_set_row(_i, status="running", progress=msg)),
+                        on_delta=None,
+                        variation_seed=str(uuid.uuid4())[:8],
+                    )
+                    self.after(0, lambda idx=i, r=result: self._bulk_after_success(idx, r))
+                    succeeded += 1
+                    done = True
+                except Exception as e:
+                    attempts += 1
+                    logger.exception(f"Bulk set {i} attempt {attempts} failed")
+                    if attempts >= 2:
+                        err = str(e)
+                        self.after(0, lambda idx=i, msg=err: self._bulk_set_row(
+                            idx, status="failed", error=msg))
+                        failed += 1
+                    else:
+                        self.after(0, lambda idx=i, msg=str(e): self._bulk_set_row(
+                            idx, status="running",
+                            progress=f"retrying ({msg[:40]})"))
+                        time.sleep(1.0)
 
         self.after(0, lambda: self._bulk_run_finished(succeeded, failed))
 
