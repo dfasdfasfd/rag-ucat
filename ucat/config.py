@@ -152,3 +152,49 @@ def api_status() -> tuple[bool, str]:
     if not os.environ.get("VOYAGE_API_KEY"):
         return False, "VOYAGE_API_KEY not set (add to .env)"
     return True, "Connected"
+
+
+# ─── Bulk cost estimator ──────────────────────────────────────────────────────
+
+def estimate_bulk_cost(
+    n: int,
+    llm: str,
+    *,
+    multi_judge: bool,
+    verify: bool,
+) -> tuple[float, float]:
+    """Estimate total USD cost for an N-set bulk run.
+
+    Returns ``(low, high)`` where:
+      • low  assumes generation input tokens hit the prompt cache (typical after
+        the first iteration).
+      • high assumes a cold cache for every iteration (worst case).
+
+    Token assumptions reflect telemetry observations from single-shot runs:
+      gen:    ~3000 input + ~2000 output
+      verify: ~1500 input + ~600 output  (Haiku, single-judge)
+      jury:   add Sonnet pass + Opus second-pass at similar token shapes
+    """
+    if n <= 0:
+        return 0.0, 0.0
+
+    costs = MODEL_COSTS[llm]
+    gen_low  = (3000 * costs["cache_read"] + 2000 * costs["out"]) / 1_000_000
+    gen_high = (3000 * costs["in"]         + 2000 * costs["out"]) / 1_000_000
+    per_low, per_high = gen_low, gen_high
+
+    if verify:
+        haiku = MODEL_COSTS["claude-haiku-4-5"]
+        verify_per = (1500 * haiku["in"] + 600 * haiku["out"]) / 1_000_000
+        per_low  += verify_per
+        per_high += verify_per
+
+    if multi_judge:
+        sonnet = MODEL_COSTS["claude-sonnet-4-6"]
+        opus   = MODEL_COSTS["claude-opus-4-7"]
+        jury_per = ((1500 * sonnet["in"] + 600 * sonnet["out"]) / 1_000_000
+                  + (1500 * opus["in"]   + 600 * opus["out"])   / 1_000_000)
+        per_low  += jury_per
+        per_high += jury_per
+
+    return n * per_low, n * per_high
