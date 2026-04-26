@@ -149,6 +149,8 @@ class RAGEngine:
                 "Include realistic units (e.g. £000s, %, kg). "
                 "Make data internally consistent with the questions you write.\n"
             )
+            if subtype:
+                role += f"\nThe stimulus chart MUST be type: '{subtype}'.\n"
         if section == "AR":
             role += (
                 "\nCRITICAL — AR panels are STRUCTURED shape lists. "

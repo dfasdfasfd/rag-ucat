@@ -263,6 +263,32 @@ def test_system_blocks_vr_no_subtype_omits_minigame_kind_lock():
         f"expected no minigame_kind lock in mixed mode:\n{text}"
 
 
+def test_system_blocks_qr_bar_locks_chart_type():
+    eng = _engine()
+    blocks = eng._system_blocks("QR", retrieved=[], target_difficulty=3.0,
+                                  subtype="bar")
+    text = _block_text(blocks)
+    assert "stimulus chart MUST be type: 'bar'" in text, \
+        f"missing chart-type lock:\n{text}"
+
+
+def test_system_blocks_qr_table_locks_chart_type():
+    eng = _engine()
+    blocks = eng._system_blocks("QR", retrieved=[], target_difficulty=3.0,
+                                  subtype="table")
+    text = _block_text(blocks)
+    assert "stimulus chart MUST be type: 'table'" in text
+
+
+def test_system_blocks_qr_no_subtype_omits_chart_lock():
+    eng = _engine()
+    blocks = eng._system_blocks("QR", retrieved=[], target_difficulty=3.0,
+                                  subtype=None)
+    text = _block_text(blocks)
+    assert "stimulus chart MUST be" not in text, \
+        f"expected no chart lock in mixed mode:\n{text}"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
