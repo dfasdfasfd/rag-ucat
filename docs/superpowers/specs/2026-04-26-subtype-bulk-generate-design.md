@@ -12,7 +12,7 @@
 
 Today's Bulk Generate runs at the section level: pick `DM` and you get sets of 5 mixed-subtype questions (one syllogism, one venn, one logical, etc.). Students drilling a specific subtype have no targeted practice path — they generate full mixed sets and ignore four-fifths of each one.
 
-Subtype targeting lets the user pick (for example) `DM → Venn → 10 questions` and get exactly that: 2 sets of 5 venn questions each. The same flow works for VR (True/False/Can't Tell vs Multiple choice) and QR (table, bar, line, stacked bar, pie). AR is unchanged.
+Subtype targeting lets the user pick (for example) `DM → Venn → 10 questions` and get exactly that: 2 sets of 5 venn questions each. The same flow works for VR (TFC, main idea, paraphrase, tone & purpose, inference) and QR (table, bar, line, stacked bar, pie). AR is unchanged.
 
 ## 2. Non-goals
 
@@ -22,7 +22,8 @@ Subtype targeting lets the user pick (for example) `DM → Venn → 10 questions
 - **Subtype targeting in the single-shot Generate tab.** The plumbing in `rag.generate()` will accept a `subtype` kwarg, but the Generate tab UI is unchanged. Adding it there is a follow-up.
 - **Per-subtype KB coverage gating.** No new check on whether the KB has indexed examples of the chosen subtype. Today's "no indexed docs for this section" check is sufficient.
 - **Trimming overflow questions.** If the user asks for 7 questions and a set has 5, we generate 2 full sets (10 questions), not 7 with 3 trimmed. Sets stay whole.
-- **Richer VR subtypes (main idea, paraphrase, tone & purpose, inference).** The `ucat/models.py` Question schema does not have a `minigame_kind` field today; only `Question.type` (which carries `tf` vs `mc` for VR). Adding the richer 5-way VR breakdown requires a schema change to Question, prompt-side support for emitting `minigame_kind`, and updates to verification/format/db. That's a separate spec. This spec restricts VR to the two subtypes the current schema can enforce: `tf` and `mc`.
+- **Always-on `minigame_kind` tagging for mixed runs.** This spec adds `minigame_kind` to the Question schema (see §7.0) but only *requires* the LLM to emit it when a VR subtype is targeted. Mixed-mode runs leave the field unset (None). A future spec can require it on every question for downstream Pocket UCAT routing.
+- **Backfill of `minigame_kind` on existing KB rows.** Legacy rows simply have `minigame_kind: None`. No migration. They render and re-validate fine because the field is `Optional[str]`.
 
 ## 3. User flow
 
@@ -58,8 +59,11 @@ SUBTYPES_BY_SECTION = {
         ("argument",     "Argument"),
     ],
     "VR": [
-        ("tf",           "True / False / Can't Tell"),
-        ("mc",           "Multiple choice (A-D)"),
+        ("tfc",          "True / False / Can't Tell"),
+        ("main-idea",    "Main idea"),
+        ("paraphrase",   "Paraphrase match"),
+        ("tone-purpose", "Tone & purpose"),
+        ("inference",    "Inference"),
     ],
     "QR": [
         ("table",        "Table"),
@@ -74,10 +78,10 @@ SUBTYPES_BY_SECTION = {
 
 The dropdown always prepends an `("", "Any (mixed)")` option in code. "Any" is represented as empty string at the widget layer and `None` once normalized in `_bulk_start()`.
 
-Storage values match the `Question.type` field already in the schema:
-- DM uses `Question.type` directly (`syllogism`, `logical`, `venn`, `probability`, `argument`).
-- VR uses `Question.type` set to `tf` or `mc`.
-- QR uses `QRChart.type` on the stimulus (one chart per set, so all 4 questions naturally share the chart type).
+Storage values per section:
+- **DM** uses `Question.type` directly (`syllogism`, `logical`, `venn`, `probability`, `argument`). Already in the schema.
+- **VR** uses the new `Question.minigame_kind` field (see §7.0). When `tfc` is targeted, the LLM must also set `Question.type = "tf"`; for the other four VR kinds, `Question.type = "mc"`.
+- **QR** uses `QRChart.type` on the stimulus (one chart per set, so all 4 questions naturally share the chart type). Already in the schema.
 
 ## 5. UI changes — Bulk tab
 
@@ -153,6 +157,36 @@ The cost-preview banner always expresses cost in `n_sets`.
 
 ## 7. Generation pipeline changes
 
+### 7.0 Schema change — `Question.minigame_kind`
+
+Add one new optional field to `Question` in `ucat/models.py`:
+
+```python
+class Question(BaseModel):
+    number: int
+    text: str
+    type: Optional[str] = None
+    minigame_kind: Optional[str] = Field(    # NEW
+        default=None,
+        description=(
+            "Pocket UCAT routing tag. For VR subtype targeting: one of "
+            "'tfc', 'main-idea', 'paraphrase', 'tone-purpose', 'inference'. "
+            "For DM (future use): syllogism / logic-grid / venn / probability / "
+            "argument-strength. Optional — legacy rows and mixed-mode runs may "
+            "leave this null."
+        ),
+    )
+    options: List[OptionItem] = Field(...)
+    # ... existing fields unchanged ...
+```
+
+Why optional with no validation:
+- Legacy KB rows (and mixed-mode generations) have no value; `Optional[str] = None` keeps them valid.
+- Per-section allowed values diverge (VR has 5 kinds; DM mapping uses different labels than `Question.type`; AR/QR don't use it). Encoding section-conditional Literal unions in Pydantic adds complexity without runtime benefit — application-level prompt + drift checks are sufficient.
+- Anthropic strict structured-output mode is unaffected — Optional fields become nullable in the JSON schema.
+
+No DB migration. Stored JSON gains the field on new rows; old rows lack it; both deserialize cleanly.
+
 ### 7.1 `RAGEngine.generate()` signature
 
 ```python
@@ -190,11 +224,17 @@ When `subtype` is set, the section-specific block changes:
 
 - **VR** — append:
   ```
-  All 4 questions MUST use `type: '{subtype}'`.
+  All 4 questions MUST set `minigame_kind: '{subtype}'`.
   {tf-or-mc reminder}
+  {kind-specific reminder}
   ```
-  - If `subtype == "tf"`: `Use exactly 3 options labelled "True", "False", "Can't Tell".`
-  - If `subtype == "mc"`: `Use 4 options labelled A, B, C, D.`
+  - If `subtype == "tfc"`: `Set type:'tf' on every question. Use exactly 3 options labelled "True", "False", "Can't Tell". Each question is a statement the student judges as supported / contradicted / not addressed by the passage.`
+  - Else: `Set type:'mc' on every question. Use 4 options labelled A, B, C, D.`
+  - Plus one of:
+    - `main-idea`: `Each question asks for the main idea, central thesis, best title, or overall conclusion of the passage. Distractors should be plausible secondary points or over-specific details.`
+    - `paraphrase`: `Each question quotes a phrase or sentence from the passage and asks which option best restates it. Distractors should be near-paraphrases that subtly distort the original meaning.`
+    - `tone-purpose`: `Each question asks for the author's tone, attitude, or rhetorical purpose (e.g. to argue / inform / caution / evaluate). Options should be precise tone words, not synonyms of each other.`
+    - `inference`: `Each question asks what can be inferred — a conclusion supported by but not stated in the passage. Distractors should be either explicitly stated (not inferences) or unsupported.`
 
 - **QR** — append:
   ```
@@ -225,19 +265,22 @@ if subtype:
         if actual_chart != subtype:
             result["subtype_drift"] = f"Asked {subtype}, got chart type {actual_chart}"
     else:
-        # DM and VR both check Question.type on each item.
-        actuals = [q.get("type") for q in data.get("questions", [])]
+        # DM checks Question.type; VR checks Question.minigame_kind.
+        field = "minigame_kind" if section == "VR" else "type"
+        actuals = [q.get(field) for q in data.get("questions", [])]
         if not all(a == subtype for a in actuals):
             result["subtype_drift"] = f"Asked {subtype}, got {actuals}"
 ```
 
+For VR `tfc`, the structural check (3 options labelled True/False/Can't Tell, `type: tf`) is already enforced by the existing Question Pydantic validation, so subtype drift detection only needs to verify `minigame_kind`.
+
 `result["subtype_drift"]` is a string (or absent). Drift is **not** retried — empirically the LLM rarely self-corrects, and a paid retry on the same prompt usually produces the same drift. The user reviews flagged sets and discards as needed.
 
-### 7.5 No schema changes
+### 7.5 Schema impact summary
 
-- `Question.type` is already `Optional[str]` and accepts arbitrary subtype strings (used today as a DM tag; this spec extends that usage to VR with values `tf` / `mc`).
-- `QRChart.type` already enumerates `table | bar | line | stacked_bar | pie`.
-- No new Pydantic fields, no DB migration. Legacy KB rows with no `type` on VR questions still validate.
+- `Question.minigame_kind` — **new**, `Optional[str] = None` (see §7.0). No DB migration; legacy rows have null.
+- `Question.type` — unchanged. Still used by DM (subtype) and VR (`tf` vs `mc`).
+- `QRChart.type` — unchanged. Already enumerates `table | bar | line | stacked_bar | pie`.
 
 ## 8. Settings additions
 
@@ -281,6 +324,9 @@ No new event types; `telemetry.emit()` already accepts arbitrary fields.
 
 ## 11. Files touched
 
+- **`ucat/models.py`**
+  - Add `minigame_kind: Optional[str] = None` to `Question` per §7.0.
+
 - **`ucat/config.py`**
   - Add `SET_SIZES` dict.
   - Add `SUBTYPES_BY_SECTION` dict.
@@ -288,7 +334,7 @@ No new event types; `telemetry.emit()` already accepts arbitrary fields.
 
 - **`ucat/rag.py`**
   - `generate()` gains `subtype: Optional[str] = None` kwarg.
-  - `_system_blocks()` gains `subtype` param and emits the override text described in §7.2.
+  - `_system_blocks()` gains `subtype` param and emits the override text described in §7.2 (DM, VR, QR overrides).
   - User prompt assembly appends the subtype line per §7.3.
   - Drift detection block per §7.4 added before `return result`.
   - Trace fields include `subtype`.
@@ -308,8 +354,10 @@ No new event types; `telemetry.emit()` already accepts arbitrary fields.
 
 - **Smoke (DM venn):** Pick DM → Venn → Quantity 10 → Start. Verify helper line reads `→ 2 sets × 5 questions = 10 questions`. Two sets land in History. Open each in the preview pane: every question has `type: "venn"` and a structured `venn` field renders.
 - **Rounding (DM logical):** Quantity 7 → helper reads `→ 2 sets × 5 questions = 10 questions (3 extra)`. Two sets generated.
-- **VR tf:** Pick VR → True/False/Can't Tell → Quantity 8. Two sets generated; every question has 3 options (`True`, `False`, `Can't Tell`) and `type: tf`.
-- **VR mc:** Pick VR → Multiple choice → Quantity 8. Two sets generated; every question has 4 options (A-D) and `type: mc`.
+- **VR tfc:** Pick VR → True/False/Can't Tell → Quantity 8. Two sets generated; every question has 3 options (`True`, `False`, `Can't Tell`), `type: tf`, and `minigame_kind: tfc`.
+- **VR main idea:** Pick VR → Main idea → Quantity 8. Two sets; every question has 4 options A-D, `type: mc`, `minigame_kind: main-idea`, and the question text asks about the passage's main idea / thesis / title.
+- **VR paraphrase / tone-purpose / inference:** Same structural assertions, with `minigame_kind` matching the dropdown selection and the question stem reflecting the kind.
+- **Schema backwards-compat:** Re-validate an existing KB VR row (which has no `minigame_kind` field). Pydantic accepts it; rendering and verification still work.
 - **QR bar:** Pick QR → Bar chart → Quantity 8. Two sets; both stimuli have `type: "bar"` with categories + series.
 - **Any backwards-compat:** Subtype dropdown left on "Any (mixed)". Quantity label reads `Sets:`. Helper line hidden. Behavior identical to pre-change bulk runs.
 - **AR disabled:** Switch to AR. Subtype dropdown shows "Any" greyed out. Quantity label stays `Sets:`. Run proceeds as today.
