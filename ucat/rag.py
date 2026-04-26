@@ -41,6 +41,36 @@ def _to_schema_shape(qset: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _detect_subtype_drift(section: str, data: Dict[str, Any],
+                            subtype: Optional[str]) -> Optional[str]:
+    """Return a human-readable drift message if the parsed set doesn't match
+    the requested subtype, else None.
+
+    - DM → checks Question.type on every question
+    - VR → checks Question.minigame_kind on every question
+    - QR → checks QRChart.type on the stimulus
+    - AR → no subtype targeting; always returns None
+    - subtype is None → always returns None
+    """
+    if not subtype:
+        return None
+
+    if section == "QR":
+        actual = (data.get("stimulus") or {}).get("type")
+        if actual != subtype:
+            return f"Asked {subtype}, got chart type {actual!r}"
+        return None
+
+    if section == "AR":
+        return None
+
+    field = "minigame_kind" if section == "VR" else "type"
+    actuals = [q.get(field) for q in data.get("questions", [])]
+    if not all(a == subtype for a in actuals):
+        return f"Asked {subtype}, got {actuals}"
+    return None
+
+
 class RAGEngine:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -334,6 +364,9 @@ class RAGEngine:
             data = parsed.model_dump()
             data["section"] = section
 
+            # Subtype drift check — fast, deterministic, no API call.
+            subtype_drift = _detect_subtype_drift(section, data, subtype)
+
             # Verification — sync path runs LLM judges inline; async path
             # defers them to a background thread (kicked off after the
             # rag_generate trace closes, below).
@@ -383,6 +416,7 @@ class RAGEngine:
                 "verdict_overall_correct": (verdict_dict or {}).get("overall_correct"),
                 "coverage_flags": coverage_dict.get("flags", []),
                 "retrieved_ids": [d["id"] for _, d in retrieved],
+                "subtype_drift": subtype_drift,
             })
 
             # Dedup detection against KB.
@@ -420,14 +454,15 @@ class RAGEngine:
             ).start()
 
         return {
-            "data":       data,
-            "retrieved":  retrieved,
-            "usage":      total_usage,
-            "verdict":    verdict_dict,
-            "coverage":   coverage_dict,
-            "difficulty": cal,
-            "dup_warning": dup_warning,
-            "row_id":     row_id,
+            "data":          data,
+            "retrieved":     retrieved,
+            "usage":         total_usage,
+            "verdict":       verdict_dict,
+            "coverage":      coverage_dict,
+            "difficulty":    cal,
+            "dup_warning":   dup_warning,
+            "row_id":        row_id,
+            "subtype_drift": subtype_drift,
         }
 
     # ── Verification helpers ─────────────────────────────────────────────────

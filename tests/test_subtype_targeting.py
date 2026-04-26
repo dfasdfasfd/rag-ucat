@@ -289,6 +289,66 @@ def test_system_blocks_qr_no_subtype_omits_chart_lock():
         f"expected no chart lock in mixed mode:\n{text}"
 
 
+# ─── Drift detection ─────────────────────────────────────────────────────────
+
+from ucat.rag import _detect_subtype_drift
+
+
+def test_drift_dm_all_match():
+    data = {"questions": [{"type": "venn"} for _ in range(5)]}
+    assert _detect_subtype_drift("DM", data, "venn") is None
+
+
+def test_drift_dm_one_wrong_flags_drift():
+    data = {"questions": [
+        {"type": "venn"}, {"type": "venn"}, {"type": "syllogism"},
+        {"type": "venn"}, {"type": "venn"},
+    ]}
+    drift = _detect_subtype_drift("DM", data, "venn")
+    assert drift is not None and "syllogism" in drift, \
+        f"expected drift mentioning syllogism, got {drift!r}"
+
+
+def test_drift_vr_uses_minigame_kind_field():
+    data = {"questions": [{"minigame_kind": "main-idea"} for _ in range(4)]}
+    assert _detect_subtype_drift("VR", data, "main-idea") is None
+
+
+def test_drift_vr_minigame_kind_mismatch():
+    data = {"questions": [
+        {"minigame_kind": "main-idea"},
+        {"minigame_kind": "inference"},
+        {"minigame_kind": "main-idea"},
+        {"minigame_kind": "main-idea"},
+    ]}
+    drift = _detect_subtype_drift("VR", data, "main-idea")
+    assert drift is not None and "inference" in drift
+
+
+def test_drift_qr_chart_type_mismatch():
+    data = {"stimulus": {"type": "line"}, "questions": []}
+    drift = _detect_subtype_drift("QR", data, "bar")
+    assert drift is not None and "line" in drift
+
+
+def test_drift_qr_chart_type_match():
+    data = {"stimulus": {"type": "bar"}, "questions": []}
+    assert _detect_subtype_drift("QR", data, "bar") is None
+
+
+def test_drift_subtype_none_returns_none():
+    """No subtype requested → no drift possible, regardless of content."""
+    data = {"questions": [{"type": "anything"}]}
+    assert _detect_subtype_drift("DM", data, None) is None
+
+
+def test_drift_vr_missing_minigame_kind_flags_drift():
+    """Legacy/un-tagged questions should be flagged as drift when subtype was asked."""
+    data = {"questions": [{}, {}, {}, {}]}
+    drift = _detect_subtype_drift("VR", data, "main-idea")
+    assert drift is not None
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
