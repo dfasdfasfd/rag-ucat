@@ -20,9 +20,11 @@ try:
 except ImportError:
     _HAS_PIL = False
 
+from .coverage import pick_diversification
 from .config import (APP_TITLE, LLM_CHOICES, EMBED_CHOICES, SECTIONS, SECTION_COLORS,
                       DEFAULT_LLM, DEFAULT_EMBED, IRT_BANDS, api_status, Settings,
-                      BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost)
+                      BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost,
+                      SUBTYPES_BY_SECTION, SET_SIZES)
 from .db import Database
 from .format import format_qset
 from .rag import RAGEngine
@@ -411,8 +413,23 @@ class App(tk.Tk):
                            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
                            activeforeground=ACCENT, font=FB, indicatoron=False,
                            relief="flat", bd=1, padx=12, pady=6, cursor="hand2",
-                           command=self._bulk_inputs_changed
+                           command=self._bulk_section_changed
                            ).pack(side="left", padx=4)
+
+        # Subtype dropdown — populated based on the selected section.
+        sb = tk.Frame(p, bg=BG); sb.pack(anchor="w", pady=(0, 10))
+        tk.Label(sb, text="Subtype:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._bulk_subtype = tk.StringVar(value="")
+        self._bulk_subtype_cb = ttk.Combobox(
+            sb, textvariable=self._bulk_subtype,
+            state="readonly", width=32, font=FM,
+        )
+        self._bulk_subtype_cb.pack(side="left")
+        self._bulk_subtype_cb.bind(
+            "<<ComboboxSelected>>", lambda _e: self._bulk_inputs_changed()
+        )
+        # Initial population uses the current section.
+        self._bulk_refresh_subtype_choices()
 
         # Quantity + topic hint row.
         qr = tk.Frame(p, bg=BG); qr.pack(fill="x", pady=(0, 10))
@@ -473,6 +490,41 @@ class App(tk.Tk):
 
         # Initialise the cost banner.
         self._bulk_inputs_changed()
+
+    def _bulk_section_changed(self):
+        """Called when the Section radio changes. Refreshes subtype choices
+        and runs the standard inputs-changed update."""
+        self._bulk_refresh_subtype_choices()
+        self._bulk_inputs_changed()
+
+    def _bulk_refresh_subtype_choices(self):
+        """Rebuild the Subtype combobox values for the current section,
+        restoring the user's last choice for that section."""
+        section = self._bulk_sec.get()
+        entries = SUBTYPES_BY_SECTION.get(section, [])
+
+        # Build the displayed list: "Any (mixed)" always first, then human labels.
+        labels = ["Any (mixed)"] + [lbl for _v, lbl in entries]
+        self._bulk_subtype_cb.config(values=labels)
+
+        # Disable for sections with no subtypes (AR).
+        if not entries:
+            self._bulk_subtype_cb.config(state="disabled")
+            self._bulk_subtype.set("Any (mixed)")
+            return
+        self._bulk_subtype_cb.config(state="readonly")
+
+        # Restore last-used subtype for this section.
+        by_section = self.settings.get("bulk_subtype_by_section") or {}
+        stored_value = by_section.get(section, "")
+        if stored_value:
+            stored_label = next(
+                (lbl for v, lbl in entries if v == stored_value),
+                "Any (mixed)",
+            )
+            self._bulk_subtype.set(stored_label)
+        else:
+            self._bulk_subtype.set("Any (mixed)")
 
     # Stub methods — bodies filled in by later tasks.
     def _bulk_inputs_changed(self):
@@ -671,15 +723,17 @@ class App(tk.Tk):
         diff_cell    = "—"
         if row["result"]:
             v = row["result"].get("verdict") or {}
+            sym_disagreed = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
             if not v:
                 verdict_cell = "—"
+            elif v.get("pending"):
+                # Async verify still in flight; symbolic_qr may already disagree.
+                verdict_cell = f"⟳ ⚠{sym_disagreed}" if sym_disagreed else "⟳"
             elif v.get("overall_correct", True):
-                fq = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
-                verdict_cell = "✓" if fq == 0 else f"⚠ {fq}"
+                verdict_cell = "✓" if sym_disagreed == 0 else f"⚠ {sym_disagreed}"
             else:
-                fq  = len(v.get("flagged_questions") or [])
-                sym = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
-                verdict_cell = f"⚠ {fq + sym}"
+                fq = len(v.get("flagged_questions") or [])
+                verdict_cell = f"⚠ {fq + sym_disagreed}"
 
             u = row["result"].get("usage") or {}
             if u.get("cost_usd") is not None:
@@ -740,6 +794,36 @@ class App(tk.Tk):
         self._status(tail)
         self._bulk_inputs_changed()  # re-evaluate Start button against new state
 
+    def _bulk_verify_complete(self, idx: int, update: Dict[str, Any]):
+        """Main-thread; merges async-verify outcome into a bulk row that already
+        rendered as 'done'. Stale rows (idx out of range) are silently dropped.
+        """
+        if idx < 1 or idx > len(self._bulk_rows):
+            return
+        row = self._bulk_rows[idx - 1]
+        result = row.get("result") or {}
+        # Patch the stored result so the row re-renders with the final verdict,
+        # final cost, and recalibrated difficulty.
+        result["verdict"]    = update.get("verdict") or result.get("verdict")
+        result["usage"]      = update.get("usage")   or result.get("usage")
+        result["difficulty"] = update.get("difficulty") or result.get("difficulty")
+        self._bulk_set_row(idx, result=result)
+
+        # Add the verify-only delta to bulk + session totals so cost columns
+        # converge on the true post-verify total without double-counting.
+        vu = update.get("verify_usage") or {}
+        delta_cost = vu.get("cost_usd", 0.0) or 0.0
+        self._bulk_run_cost += delta_cost
+        self._session_cost  += delta_cost
+        self._session_tokens["in"]      += vu.get("input_tokens", 0) or 0
+        self._session_tokens["out"]     += vu.get("output_tokens", 0) or 0
+        self._session_tokens["cache_r"] += vu.get("cache_read_input_tokens", 0) or 0
+        self._session_tokens["cache_w"] += vu.get("cache_creation_input_tokens", 0) or 0
+        tot = sum(self._session_tokens.values())
+        self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._refresh_stats()
+        self._refresh_insights()
+
     def _bulk_after_success(self, idx: int, result: Dict[str, Any]):
         """Main-thread; updates row + global session counters + History."""
         self._bulk_set_row(idx, status="done", result=result)
@@ -774,6 +858,12 @@ class App(tk.Tk):
             self.after(0, lambda idx=i, total=n: self._bulk_progress_lbl.config(
                 text=f"{idx - 1} / {total} — generating set {idx}…"))
 
+            # Pre-pick an under-represented scenario + recently-overused topics
+            # to avoid, so the bulk run rotates through diverse scenarios instead
+            # of clustering on whatever the LLM defaults to. Bounded prompt cost.
+            stats = self.db.coverage_stats(section, last_n=200)
+            diversify = pick_diversification(stats, section) or {}
+
             attempts = 0
             done = False
             while attempts < 2 and not done:
@@ -783,7 +873,11 @@ class App(tk.Tk):
                         on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
                             self._bulk_set_row(_i, status="running", progress=msg)),
                         on_delta=None,
+                        on_verify_complete=lambda upd, idx=i: self.after(
+                            0, lambda u=upd, _i=idx: self._bulk_verify_complete(_i, u)),
                         variation_seed=str(uuid.uuid4())[:8],
+                        force_scenario=diversify.get("scenario"),
+                        avoid_topics=diversify.get("avoid_topics"),
                     )
                     self.after(0, lambda idx=i, r=result: self._bulk_after_success(idx, r))
                     succeeded += 1
@@ -992,6 +1086,8 @@ class App(tk.Tk):
                     section, hint,
                     on_progress=lambda m: self.after(0, lambda msg=m: self._gprog.config(text=f"⟳  {msg}")),
                     on_delta=on_delta,
+                    on_verify_complete=lambda upd: self.after(
+                        0, lambda u=upd: self._on_verify_complete(u)),
                     variation_seed=variation_seed,
                 )
                 self.after(0, lambda: self._gen_ok(result, section))
@@ -1047,21 +1143,10 @@ class App(tk.Tk):
         self._wout("\n".join(ctx_lines).strip(), self._cout)
 
         # Verdict badge.
-        if verdict:
-            ok = verdict.get("overall_correct", True)
-            mode = verdict.get("mode", "?")
-            sym = verdict.get("symbolic_qr") or {}
-            disagreed = len(sym.get("disagreed", []))
-            if ok and disagreed == 0:
-                conf = verdict.get("confidence", "—") if mode == "single" else (
-                    "unanimous" if verdict.get("unanimous") else "majority")
-                self._verdict_lbl.config(text=f"✓ verified ({mode} · {conf})", fg=SUCCESS)
-            else:
-                bits = []
-                fq = verdict.get("flagged_questions", [])
-                if fq: bits.append(f"{len(fq)} flagged")
-                if disagreed: bits.append(f"{disagreed} arithmetic mismatch")
-                self._verdict_lbl.config(text=f"⚠ {', '.join(bits) or 'issues'}", fg=DANGER)
+        self._render_verdict_badge(verdict)
+        # Remember which row this generation produced so the (possibly delayed)
+        # async verify callback can detect a stale follow-up after regenerate.
+        self._last_row_id = result.get("row_id")
 
         if dup:
             self._dup_lbl.config(text=f"⚠ {dup}", fg=WARN)
@@ -1082,6 +1167,57 @@ class App(tk.Tk):
         self._gprog.config(text="✓  Done!")
         self._refresh_stats(); self._refresh_out(); self._refresh_insights()
         self._status(f"Generated {SECTIONS[section]} using {len(retrieved)} context doc(s)")
+
+    def _render_verdict_badge(self, verdict: Optional[Dict[str, Any]]):
+        """Update the verdict label from a verdict dict. Handles three states:
+        none, pending (async verify in flight), and final (pass/fail)."""
+        if not verdict:
+            self._verdict_lbl.config(text="", fg=SUCCESS)
+            return
+        if verdict.get("pending"):
+            sym = verdict.get("symbolic_qr") or {}
+            disagreed = len(sym.get("disagreed", []))
+            if disagreed:
+                self._verdict_lbl.config(
+                    text=f"⚠ {disagreed} arithmetic mismatch · ⟳ verifying…", fg=DANGER)
+            else:
+                self._verdict_lbl.config(text="⟳ verifying answers…", fg=ACCENT)
+            return
+        ok = verdict.get("overall_correct", True)
+        mode = verdict.get("mode", "?")
+        sym = verdict.get("symbolic_qr") or {}
+        disagreed = len(sym.get("disagreed", []))
+        if ok and disagreed == 0:
+            conf = verdict.get("confidence", "—") if mode == "single" else (
+                "unanimous" if verdict.get("unanimous") else "majority")
+            self._verdict_lbl.config(text=f"✓ verified ({mode} · {conf})", fg=SUCCESS)
+        else:
+            bits = []
+            fq = verdict.get("flagged_questions", [])
+            if fq: bits.append(f"{len(fq)} flagged")
+            if disagreed: bits.append(f"{disagreed} arithmetic mismatch")
+            self._verdict_lbl.config(text=f"⚠ {', '.join(bits) or 'issues'}", fg=DANGER)
+
+    def _on_verify_complete(self, update: Dict[str, Any]):
+        """Main-thread handler for async verify completion. Drops stale callbacks
+        (user has regenerated since), updates the verdict badge, and adds the
+        verify-only token/cost delta to session totals."""
+        row_id = update.get("row_id")
+        # Stale: a newer generation has happened. Skip UI mutation but keep the
+        # db row updated (the worker already did that).
+        if row_id is None or row_id != getattr(self, "_last_row_id", None):
+            return
+        self._render_verdict_badge(update.get("verdict"))
+        vu = update.get("verify_usage") or {}
+        self._session_cost += vu.get("cost_usd", 0) or 0
+        self._session_tokens["in"]      += vu.get("input_tokens", 0) or 0
+        self._session_tokens["out"]     += vu.get("output_tokens", 0) or 0
+        self._session_tokens["cache_r"] += vu.get("cache_read_input_tokens", 0) or 0
+        self._session_tokens["cache_w"] += vu.get("cache_creation_input_tokens", 0) or 0
+        tot = sum(self._session_tokens.values())
+        self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._refresh_stats()
+        self._refresh_insights()
 
     def _gen_err(self, err: str):
         self._wout(f"ERROR\n{'─'*40}\n{err}", self._gout)
