@@ -848,7 +848,8 @@ class App(tk.Tk):
              model=llm,
              verify=verify,
              multi_judge=jury,
-             estimated_cost_high=round(est_high, 4))
+             estimated_cost_high=round(est_high, 4),
+             subtype=(self.settings.get("bulk_subtype") or None))
 
     def _bulk_run_finished(self, succeeded: int, failed: int, stopped: bool = False):
         n = len(self._bulk_rows)
@@ -865,7 +866,9 @@ class App(tk.Tk):
              failed=failed,
              stopped=stopped,
              actual_cost_usd=round(self._bulk_run_cost, 4),
-             duration_s=round(elapsed, 1))
+             duration_s=round(elapsed, 1),
+             subtype=(self.settings.get("bulk_subtype") or None),
+             drift_count=drift_count)
         self._bulk_thread = None
         self._bulk_started_at = None
         self._bulk_start_btn.config(state="normal", text="⚡  START BULK RUN")
