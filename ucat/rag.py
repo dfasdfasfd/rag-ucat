@@ -8,7 +8,8 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import (DEFAULT_VERIFY_LLM, DEFAULT_JUDGE2_LLM, IRT_BANDS,
-                      Settings, SECTIONS, SECTION_DESC, difficulty_label)
+                      Settings, SECTIONS, SECTION_DESC, difficulty_label,
+                      SUBTYPES_BY_SECTION)
 from .calibration import calibrate_set, difficulty_distance
 from .coverage import aggregate_set
 from .db import Database, embed_text_for
@@ -252,6 +253,7 @@ class RAGEngine:
         section: str,
         hint: str = "",
         *,
+        subtype: Optional[str] = None,
         on_progress: Optional[Callable[[str], None]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
         on_verify_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -276,13 +278,15 @@ class RAGEngine:
                    target_difficulty=target,
                    verify=self.verify_enabled,
                    multi_judge=self.multi_judge,
-                   async_verify=async_verify) as t:
+                   async_verify=async_verify,
+                   subtype=subtype) as t:
 
             if on_progress: on_progress("Embedding retrieval query…")
             qvec, retrieved = self.retrieve(section, hint)
 
             if on_progress: on_progress(f"Retrieved {len(retrieved)} doc(s). Building prompt…")
-            system_blocks = self._system_blocks(section, retrieved, target)
+            system_blocks = self._system_blocks(section, retrieved, target,
+                                                  subtype=subtype)
 
             user_parts = [f"Generate a NEW UCAT {SECTIONS[section]} question set. "]
             if hint.strip():
@@ -306,6 +310,15 @@ class RAGEngine:
                 )
             if variation_seed:
                 user_parts.append(f"Variation seed for stylistic diversity: {variation_seed}. ")
+
+            if subtype:
+                # Look up the human label so the prompt nudge reads naturally.
+                label = next(
+                    (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, []) if v == subtype),
+                    subtype,
+                )
+                user_parts.append(f"All questions in this set must be of subtype: {label}. ")
+
             user_parts.append("Return ONLY the JSON object.")
             user = "".join(user_parts)
 
