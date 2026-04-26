@@ -119,6 +119,48 @@ def test_subtypes_all_entries_are_value_label_tuples():
             assert isinstance(label, str) and label, f"{section}: empty label"
 
 
+# ─── Settings: new bulk subtype keys ─────────────────────────────────────────
+
+import tempfile
+
+from ucat.config import Settings
+
+
+def test_settings_defaults_include_bulk_subtype():
+    s = Settings(path=tempfile.mktemp(suffix=".json"))
+    assert s.get("bulk_subtype") == "", \
+        f"expected '', got {s.get('bulk_subtype')!r}"
+
+
+def test_settings_defaults_include_per_section_subtype_memory():
+    s = Settings(path=tempfile.mktemp(suffix=".json"))
+    by_section = s.get("bulk_subtype_by_section")
+    assert by_section == {"VR": "", "DM": "", "QR": "", "AR": ""}, \
+        f"unexpected default: {by_section!r}"
+
+
+def test_settings_defaults_include_quantity_unit():
+    s = Settings(path=tempfile.mktemp(suffix=".json"))
+    assert s.get("bulk_quantity_unit") == "sets", \
+        f"expected 'sets', got {s.get('bulk_quantity_unit')!r}"
+
+
+def test_settings_subtype_persists_via_save_load():
+    """Confirm the new keys survive a save/load roundtrip."""
+    path = tempfile.mktemp(suffix=".json")
+    s = Settings(path=path)
+    s.set("bulk_subtype", "venn")
+    s.set("bulk_subtype_by_section",
+          {"VR": "main-idea", "DM": "venn", "QR": "bar", "AR": ""})
+    s.set("bulk_quantity_unit", "questions")
+
+    s2 = Settings(path=path)
+    assert s2.get("bulk_subtype") == "venn"
+    assert s2.get("bulk_subtype_by_section")["DM"] == "venn"
+    assert s2.get("bulk_subtype_by_section")["VR"] == "main-idea"
+    assert s2.get("bulk_quantity_unit") == "questions"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

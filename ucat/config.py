@@ -149,6 +149,12 @@ class Settings:
         "bulk_section":     "VR",
         "bulk_quantity":    10,
         "bulk_hint":        "",
+        # ── Subtype targeting (added 2026-04-26) ───────────────────────────
+        "bulk_subtype":            "",   # current dropdown value ("" == Any/mixed)
+        "bulk_subtype_by_section": {     # remember per-section choice
+            "VR": "", "DM": "", "QR": "", "AR": "",
+        },
+        "bulk_quantity_unit":      "sets",  # "sets" or "questions" (derived from subtype)
     }
 
     def __init__(self, path: str = SETTINGS_FILE):
