@@ -161,6 +161,68 @@ def test_settings_subtype_persists_via_save_load():
     assert s2.get("bulk_quantity_unit") == "questions"
 
 
+# ─── _system_blocks: subtype overrides ───────────────────────────────────────
+
+from ucat.config import Settings as _S
+from ucat.rag import RAGEngine
+
+
+class _StubDB:
+    """Minimal DB stand-in — _system_blocks doesn't query the DB."""
+    pass
+
+
+def _engine() -> RAGEngine:
+    """Build a RAGEngine with stubbed DB and an in-memory Settings."""
+    s = _S(path=tempfile.mktemp(suffix=".json"))
+    return RAGEngine(_StubDB(), s)
+
+
+def _block_text(blocks) -> str:
+    """Concatenate every text segment in the system_blocks list."""
+    return "\n".join(b.get("text", "") for b in blocks)
+
+
+def test_system_blocks_dm_subtype_locks_to_one_kind():
+    eng = _engine()
+    blocks = eng._system_blocks("DM", retrieved=[], target_difficulty=3.0,
+                                  subtype="venn")
+    text = _block_text(blocks)
+    assert "All 5 questions MUST be venn" in text, \
+        f"missing venn lock-in:\n{text}"
+    # The "include one of each" guidance must be suppressed when subtype is set.
+    assert "one of each" not in text, \
+        "expected 'one of each' to be suppressed when subtype is set"
+
+
+def test_system_blocks_dm_no_subtype_keeps_variety_guidance():
+    """Backwards compat: with no subtype, the existing variety guidance stays."""
+    eng = _engine()
+    blocks = eng._system_blocks("DM", retrieved=[], target_difficulty=3.0,
+                                  subtype=None)
+    text = _block_text(blocks)
+    assert "one of each" in text, \
+        f"expected variety guidance to be present:\n{text}"
+
+
+def test_system_blocks_dm_venn_includes_kind_specific_reminder():
+    eng = _engine()
+    blocks = eng._system_blocks("DM", retrieved=[], target_difficulty=3.0,
+                                  subtype="venn")
+    text = _block_text(blocks)
+    assert "structured `venn` field" in text, \
+        f"venn reminder missing:\n{text}"
+
+
+def test_system_blocks_dm_argument_includes_kind_specific_reminder():
+    eng = _engine()
+    blocks = eng._system_blocks("DM", retrieved=[], target_difficulty=3.0,
+                                  subtype="argument")
+    text = _block_text(blocks)
+    assert "argument strength" in text, \
+        f"argument reminder missing:\n{text}"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
