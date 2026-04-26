@@ -476,9 +476,9 @@ class App(tk.Tk):
 
         # Treeview of per-set rows.
         tf = tk.Frame(p, bg=BG); tf.pack(fill="both", expand=True, pady=(8, 0))
-        cols = ("#", "Started", "Status", "Verdict", "Cost", "Difficulty")
+        cols = ("#", "Started", "Subtype", "Status", "Verdict", "Cost", "Difficulty")
         self._bulk_tree = ttk.Treeview(tf, columns=cols, show="headings", height=10)
-        for c, w in zip(cols, (44, 90, 180, 100, 70, 80)):
+        for c, w in zip(cols, (44, 90, 110, 180, 100, 70, 80)):
             self._bulk_tree.heading(c, text=c)
             self._bulk_tree.column(c, width=w, anchor="w" if c == "Status" else "center")
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self._bulk_tree.yview)
@@ -636,10 +636,24 @@ class App(tk.Tk):
             return
 
         section = self._bulk_sec.get()
+
+        # Resolve subtype from the dropdown's human label back to its storage value.
+        label_to_value = {
+            lbl: v for v, lbl in SUBTYPES_BY_SECTION.get(section, [])
+        }
+        subtype_value = label_to_value.get(self._bulk_subtype.get(), "")
+        subtype = subtype_value or None
+
         raw = self._bulk_qty.get().strip()
         if not raw.isdigit():
             return
-        n = min(int(raw), BULK_MAX_QUANTITY)
+        n_input = int(raw)
+        if n_input < 1:
+            return
+
+        # Convert questions → sets when subtype is set; cap at the max set count.
+        n = compute_set_count(n_input, section, subtype)
+        n = min(n, BULK_MAX_QUANTITY)
         if n < 1:
             return
 
@@ -671,7 +685,7 @@ class App(tk.Tk):
 
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
-            target=self._bulk_worker, args=(section, hint, n), daemon=True
+            target=self._bulk_worker, args=(section, hint, n, subtype), daemon=True
         )
         self._bulk_thread.start()
 
@@ -725,14 +739,23 @@ class App(tk.Tk):
 
     def _bulk_seed_rows(self, n: int):
         """Initialise _bulk_rows + Treeview with N queued entries."""
-        self._bulk_rows = [{"idx": i, "status": "queued", "result": None,
-                             "error": None, "started": ""} for i in range(1, n + 1)]
+        section = self._bulk_sec.get()
+        subtype_value = self.settings.get("bulk_subtype") or ""
+        subtype_label = next(
+            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, []) if v == subtype_value),
+            "—",
+        )
+        self._bulk_rows = [
+            {"idx": i, "status": "queued", "result": None,
+              "error": None, "started": "", "subtype": subtype_value or None}
+            for i in range(1, n + 1)
+        ]
         for iid in self._bulk_tree.get_children():
             self._bulk_tree.delete(iid)
         for r in self._bulk_rows:
             self._bulk_tree.insert(
                 "", "end", iid=self._bulk_row_iid(r["idx"]),
-                values=(r["idx"], "", "queued", "—", "—", "—"),
+                values=(r["idx"], "", subtype_label, "queued", "—", "—", "—"),
             )
 
     def _bulk_set_row(self, idx: int, *,
@@ -764,13 +787,25 @@ class App(tk.Tk):
         else:  # queued
             st_cell = "queued"
 
+        # Subtype cell — derived from the row's stored subtype (set in seed_rows).
+        subtype_value = row.get("subtype")
+        subtype_cell = next(
+            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(self._bulk_sec.get(), [])
+             if v == subtype_value),
+            "—",
+        ) if subtype_value else "—"
+
         verdict_cell = "—"
         cost_cell    = "—"
         diff_cell    = "—"
         if row["result"]:
             v = row["result"].get("verdict") or {}
             sym_disagreed = len((v.get("symbolic_qr") or {}).get("disagreed") or [])
-            if not v:
+            drift = row["result"].get("subtype_drift")
+            if drift:
+                # Drift takes precedence over the normal verdict badge.
+                verdict_cell = "⚠ drift"
+            elif not v:
                 verdict_cell = "—"
             elif v.get("pending"):
                 # Async verify still in flight; symbolic_qr may already disagree.
@@ -792,7 +827,8 @@ class App(tk.Tk):
 
         self._bulk_tree.item(
             self._bulk_row_iid(idx),
-            values=(idx, row["started"], st_cell, verdict_cell, cost_cell, diff_cell),
+            values=(idx, row["started"], subtype_cell, st_cell,
+                      verdict_cell, cost_cell, diff_cell),
         )
 
     def _bulk_run_started(self, n: int):
@@ -817,6 +853,10 @@ class App(tk.Tk):
     def _bulk_run_finished(self, succeeded: int, failed: int, stopped: bool = False):
         n = len(self._bulk_rows)
         skipped = sum(1 for r in self._bulk_rows if r["status"] == "skipped")
+        drift_count = sum(
+            1 for r in self._bulk_rows
+            if (r.get("result") or {}).get("subtype_drift")
+        )
         elapsed = (time.perf_counter() - (self._bulk_started_at or time.perf_counter()))
         emit("bulk_run_end",
              section=self._bulk_sec.get(),
@@ -833,7 +873,8 @@ class App(tk.Tk):
         if stopped:
             tail = f"Stopped at {succeeded + failed} / {n}."
         else:
-            tail = f"Bulk run finished: {succeeded} succeeded, {failed} failed"
+            drift_note = f" ({drift_count} with subtype drift)" if drift_count else ""
+            tail = f"Bulk run finished: {succeeded} succeeded{drift_note}, {failed} failed"
             if skipped: tail += f", {skipped} skipped"
             tail += "."
         self._bulk_progress_lbl.config(text=tail)
@@ -886,7 +927,8 @@ class App(tk.Tk):
         self._refresh_out()
         self._refresh_insights()
 
-    def _bulk_worker(self, section: str, hint: str, n: int):
+    def _bulk_worker(self, section: str, hint: str, n: int,
+                       subtype: Optional[str]):
         self.after(0, lambda: self._bulk_run_started(n))
         succeeded = 0
         failed    = 0
@@ -916,6 +958,7 @@ class App(tk.Tk):
                 try:
                     result = self.rag.generate(
                         section, hint,
+                        subtype=subtype,
                         on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
                             self._bulk_set_row(_i, status="running", progress=msg)),
                         on_delta=None,
