@@ -223,6 +223,46 @@ def test_system_blocks_dm_argument_includes_kind_specific_reminder():
         f"argument reminder missing:\n{text}"
 
 
+def test_system_blocks_vr_tfc_locks_type_tf_and_minigame_kind():
+    eng = _engine()
+    blocks = eng._system_blocks("VR", retrieved=[], target_difficulty=3.0,
+                                  subtype="tfc")
+    text = _block_text(blocks)
+    assert "minigame_kind: 'tfc'" in text, f"tfc tag missing:\n{text}"
+    assert "type:'tf'" in text, f"type:tf lock missing:\n{text}"
+    assert '"True", "False", "Can\'t Tell"' in text, \
+        f"option labels missing:\n{text}"
+
+
+def test_system_blocks_vr_main_idea_locks_mc_and_kind():
+    eng = _engine()
+    blocks = eng._system_blocks("VR", retrieved=[], target_difficulty=3.0,
+                                  subtype="main-idea")
+    text = _block_text(blocks)
+    assert "minigame_kind: 'main-idea'" in text, f"tag missing:\n{text}"
+    assert "type:'mc'" in text, f"mc lock missing:\n{text}"
+    assert "main idea" in text, f"kind reminder missing:\n{text}"
+
+
+def test_system_blocks_vr_inference_includes_kind_reminder():
+    eng = _engine()
+    blocks = eng._system_blocks("VR", retrieved=[], target_difficulty=3.0,
+                                  subtype="inference")
+    text = _block_text(blocks)
+    assert "minigame_kind: 'inference'" in text
+    assert "inferred" in text, f"inference reminder missing:\n{text}"
+
+
+def test_system_blocks_vr_no_subtype_omits_minigame_kind_lock():
+    """Mixed-mode VR runs must not force a minigame_kind."""
+    eng = _engine()
+    blocks = eng._system_blocks("VR", retrieved=[], target_difficulty=3.0,
+                                  subtype=None)
+    text = _block_text(blocks)
+    assert "minigame_kind" not in text, \
+        f"expected no minigame_kind lock in mixed mode:\n{text}"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

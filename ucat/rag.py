@@ -157,6 +157,44 @@ class RAGEngine:
                 "color, size, count, rotation, or position. Provide BOTH a structured "
                 "spec for rendering AND a clear English description in the rule field.\n"
             )
+        if section == "VR" and subtype:
+            kind_reminders = {
+                "tfc": (
+                    "Set type:'tf' on every question. Use exactly 3 options labelled "
+                    '"True", "False", "Can\'t Tell". Each question is a statement the '
+                    "student judges as supported / contradicted / not addressed by the "
+                    "passage."
+                ),
+                "main-idea": (
+                    "Set type:'mc' on every question. Use 4 options labelled A, B, C, D. "
+                    "Each question asks for the main idea, central thesis, best title, "
+                    "or overall conclusion of the passage. Distractors should be "
+                    "plausible secondary points or over-specific details."
+                ),
+                "paraphrase": (
+                    "Set type:'mc' on every question. Use 4 options labelled A, B, C, D. "
+                    "Each question quotes a phrase or sentence from the passage and asks "
+                    "which option best restates it. Distractors should be near-paraphrases "
+                    "that subtly distort the original meaning."
+                ),
+                "tone-purpose": (
+                    "Set type:'mc' on every question. Use 4 options labelled A, B, C, D. "
+                    "Each question asks for the author's tone, attitude, or rhetorical "
+                    "purpose (e.g. to argue / inform / caution / evaluate). Options should "
+                    "be precise tone words, not synonyms of each other."
+                ),
+                "inference": (
+                    "Set type:'mc' on every question. Use 4 options labelled A, B, C, D. "
+                    "Each question asks what can be inferred — a conclusion supported by "
+                    "but not stated in the passage. Distractors should be either "
+                    "explicitly stated (not inferences) or unsupported."
+                ),
+            }
+            role += (
+                f"\nAll 4 questions MUST set `minigame_kind: '{subtype}'`.\n"
+                f"{kind_reminders.get(subtype, '')}\n"
+            )
+
         if section == "DM":
             if subtype:
                 # Subtype override: replace the variety guidance with a lock-in.
