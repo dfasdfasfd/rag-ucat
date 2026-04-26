@@ -83,6 +83,41 @@ SECTION_DESC = {
     "AR": "Type 1 set. Set A (6 panels with shape sets, hidden rule). Set B (6 panels with shape sets, different rule). Then 5 test shapes answered Set A / Set B / Neither. Panels MUST be provided as structured shape specs for visual rendering.",
 }
 
+# Question count per generated set, mirroring the min/max in the Pydantic
+# section models. Used by bulk generation to convert "N questions" → "M sets".
+SET_SIZES = {"VR": 4, "DM": 5, "QR": 4, "AR": 5}
+
+# Per-section subtype catalogue. Each entry is (storage_value, human_label).
+# storage_value matches the field used by the schema:
+#   - DM → Question.type
+#   - VR → Question.minigame_kind (with type=tf when value=='tfc', type=mc otherwise)
+#   - QR → QRChart.type on the stimulus
+# AR is intentionally empty: subtype dropdown is disabled in the UI.
+SUBTYPES_BY_SECTION = {
+    "DM": [
+        ("syllogism",    "Syllogism"),
+        ("logical",      "Logical (logic puzzles)"),
+        ("venn",         "Venn"),
+        ("probability",  "Probability"),
+        ("argument",     "Argument"),
+    ],
+    "VR": [
+        ("tfc",          "True / False / Can't Tell"),
+        ("main-idea",    "Main idea"),
+        ("paraphrase",   "Paraphrase match"),
+        ("tone-purpose", "Tone & purpose"),
+        ("inference",    "Inference"),
+    ],
+    "QR": [
+        ("table",        "Table"),
+        ("bar",          "Bar chart"),
+        ("line",         "Line chart"),
+        ("stacked_bar",  "Stacked bar"),
+        ("pie",          "Pie"),
+    ],
+    "AR": [],
+}
+
 # IRT difficulty bands (Rasch logits). Predicted by Claude per question;
 # refined when student response data accumulates.
 IRT_BANDS = {

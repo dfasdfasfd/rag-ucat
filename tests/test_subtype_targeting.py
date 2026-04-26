@@ -72,6 +72,53 @@ def test_legacy_question_without_minigame_kind_still_validates():
     assert q.minigame_kind is None
 
 
+# ─── Config: SET_SIZES + SUBTYPES_BY_SECTION ─────────────────────────────────
+
+from ucat.config import SET_SIZES, SUBTYPES_BY_SECTION
+
+
+def test_set_sizes_match_section_models():
+    """SET_SIZES must match the min/max question count baked into the Pydantic
+    section models so the ceil math in the bulk worker stays accurate."""
+    expected = {"VR": 4, "DM": 5, "QR": 4, "AR": 5}
+    assert SET_SIZES == expected, f"expected {expected}, got {SET_SIZES}"
+
+
+def test_subtypes_dm_has_five_named_subtypes():
+    values = [v for v, _ in SUBTYPES_BY_SECTION["DM"]]
+    assert values == ["syllogism", "logical", "venn", "probability", "argument"], \
+        f"unexpected DM subtypes: {values}"
+
+
+def test_subtypes_vr_has_five_minigame_kinds():
+    values = [v for v, _ in SUBTYPES_BY_SECTION["VR"]]
+    assert values == ["tfc", "main-idea", "paraphrase", "tone-purpose", "inference"], \
+        f"unexpected VR subtypes: {values}"
+
+
+def test_subtypes_qr_chart_types_match_schema_enum():
+    values = [v for v, _ in SUBTYPES_BY_SECTION["QR"]]
+    assert values == ["table", "bar", "line", "stacked_bar", "pie"], \
+        f"unexpected QR subtypes: {values}"
+
+
+def test_subtypes_ar_is_empty_list():
+    """AR has no subtype targeting in this spec; the empty list signals the
+    UI to disable the dropdown."""
+    assert SUBTYPES_BY_SECTION["AR"] == [], \
+        f"expected AR to have no subtypes, got {SUBTYPES_BY_SECTION['AR']}"
+
+
+def test_subtypes_all_entries_are_value_label_tuples():
+    for section, entries in SUBTYPES_BY_SECTION.items():
+        for entry in entries:
+            assert isinstance(entry, tuple) and len(entry) == 2, \
+                f"{section}: bad entry {entry!r}"
+            value, label = entry
+            assert isinstance(value, str) and value, f"{section}: empty value"
+            assert isinstance(label, str) and label, f"{section}: empty label"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
