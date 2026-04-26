@@ -24,7 +24,7 @@ from .coverage import pick_diversification
 from .config import (APP_TITLE, LLM_CHOICES, EMBED_CHOICES, SECTIONS, SECTION_COLORS,
                       DEFAULT_LLM, DEFAULT_EMBED, IRT_BANDS, api_status, Settings,
                       BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost,
-                      SUBTYPES_BY_SECTION, SET_SIZES)
+                      SUBTYPES_BY_SECTION, SET_SIZES, compute_set_count)
 from .db import Database
 from .format import format_qset
 from .rag import RAGEngine
@@ -433,7 +433,8 @@ class App(tk.Tk):
 
         # Quantity + topic hint row.
         qr = tk.Frame(p, bg=BG); qr.pack(fill="x", pady=(0, 10))
-        tk.Label(qr, text="Quantity:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
+        self._bulk_qty_lbl = tk.Label(qr, text="Sets:", bg=BG, fg=MUTED, font=FM)
+        self._bulk_qty_lbl.pack(side="left", padx=(0, 14))
         self._bulk_qty = tk.StringVar(value=str(self.settings.get("bulk_quantity")))
         tk.Entry(qr, textvariable=self._bulk_qty, bg=PANEL2, fg=TEXT, font=FM,
                  insertbackground=ACCENT, relief="flat", width=6).pack(side="left")
@@ -444,6 +445,13 @@ class App(tk.Tk):
         tk.Entry(qr, textvariable=self._bulk_hint, bg=PANEL2, fg=TEXT, font=FM,
                  insertbackground=ACCENT, relief="flat", width=46).pack(side="left", fill="x", expand=True)
         self._bulk_hint.trace_add("write", lambda *_: self._bulk_inputs_changed())
+
+        # Yield helper line: "→ 2 sets × 5 questions = 10 questions". Hidden
+        # when no subtype is selected.
+        self._bulk_yield_lbl = tk.Label(
+            p, text="", bg=BG, fg=MUTED, font=FS, anchor="w"
+        )
+        self._bulk_yield_lbl.pack(anchor="w", pady=(0, 4))
 
         # Cost preview banner.
         self._bulk_cost_lbl = tk.Label(
@@ -526,48 +534,86 @@ class App(tk.Tk):
         else:
             self._bulk_subtype.set("Any (mixed)")
 
-    # Stub methods — bodies filled in by later tasks.
     def _bulk_inputs_changed(self):
-        """Called whenever section / quantity / hint changes. Validates input,
-        updates the cost preview banner, persists settings, and gates the Start
-        button."""
+        """Called whenever section / subtype / quantity / hint changes.
+        Validates input, flips labels, computes the cost preview, persists
+        settings, and gates the Start button."""
         section = self._bulk_sec.get()
         hint    = self._bulk_hint.get()
+
+        # Resolve subtype: combobox stores the human label; we map back to the
+        # internal storage value (e.g. 'venn'). 'Any (mixed)' → "" → None.
+        label_to_value = {
+            lbl: v for v, lbl in SUBTYPES_BY_SECTION.get(section, [])
+        }
+        chosen_label = self._bulk_subtype.get()
+        subtype_value = label_to_value.get(chosen_label, "")
+        subtype = subtype_value or None
 
         # Persist settings.
         self.settings.set("bulk_section", section)
         self.settings.set("bulk_hint",    hint)
+        self.settings.set("bulk_subtype", subtype_value)
+        by_section = dict(self.settings.get("bulk_subtype_by_section") or {})
+        by_section[section] = subtype_value
+        self.settings.set("bulk_subtype_by_section", by_section)
+        self.settings.set("bulk_quantity_unit",
+                            "questions" if subtype else "sets")
+
+        # Flip the Quantity label.
+        self._bulk_qty_lbl.config(text=("Questions:" if subtype else "Sets:"))
 
         # Parse quantity.
         raw = self._bulk_qty.get().strip()
-        n: Optional[int] = None
-        capped = False
+        n_input: Optional[int] = None
         if raw.isdigit():
-            n = int(raw)
-            if n > BULK_MAX_QUANTITY:
-                n = BULK_MAX_QUANTITY
-                capped = True
-            if n >= 1:
-                self.settings.set("bulk_quantity", n)
+            n_input = int(raw)
+            if n_input >= 1:
+                self.settings.set("bulk_quantity", n_input)
 
-        # Update cost banner + Start enable state.
-        if n is None or n < 1:
+        # Bail if quantity is invalid.
+        if n_input is None or n_input < 1:
+            self._bulk_yield_lbl.config(text="")
+            max_input = (BULK_MAX_QUANTITY * SET_SIZES.get(section, 5)) if subtype \
+                          else BULK_MAX_QUANTITY
             self._bulk_cost_lbl.config(
-                text=f"Enter a number 1 - {BULK_MAX_QUANTITY}.",
+                text=f"Enter a number 1 - {max_input}.",
                 fg=WARN,
             )
             self._bulk_start_btn.config(state="disabled")
             return
 
+        # Compute set count and yield helper line.
+        n_sets = compute_set_count(n_input, section, subtype)
+        capped = False
+        if n_sets > BULK_MAX_QUANTITY:
+            n_sets = BULK_MAX_QUANTITY
+            capped = True
+
+        # Helper line — only when subtype is set.
+        if subtype:
+            per_set = SET_SIZES[section]
+            yielded = n_sets * per_set
+            extra = yielded - n_input
+            extra_note = f"  ({extra} extra)" if extra > 0 else ""
+            cap_note = "  (capped — split into multiple runs for more)" if capped else ""
+            self._bulk_yield_lbl.config(
+                text=f"→ {n_sets} sets × {per_set} questions = {yielded} questions{extra_note}{cap_note}",
+                fg=MUTED,
+            )
+        else:
+            self._bulk_yield_lbl.config(text="")
+
+        # Cost preview (always in sets — that's what's billed).
         llm     = self.settings.get("llm")
         verify  = bool(self.settings.get("verify"))
         jury    = bool(self.settings.get("multi_judge"))
-        low, high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+        low, high = estimate_bulk_cost(n_sets, llm, multi_judge=jury, verify=verify)
 
         suffix = "  (capped at the max — split into multiple runs for more)" if capped else ""
         self._bulk_cost_lbl.config(
             text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   "
-                 f"({n} sets × {llm}{suffix})",
+                 f"({n_sets} sets × {llm}{suffix})",
             fg=ACCENT,
         )
 

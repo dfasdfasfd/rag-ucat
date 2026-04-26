@@ -7,6 +7,7 @@ persist to a JSON file alongside the DB.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -117,6 +118,24 @@ SUBTYPES_BY_SECTION = {
     ],
     "AR": [],
 }
+
+
+def compute_set_count(n_input: int, section: str,
+                       subtype: Optional[str]) -> int:
+    """Convert the user's quantity input into a number of sets to generate.
+
+    With ``subtype=None`` (Any/mixed mode), the input is already in sets and
+    is returned as-is. With a subtype selected, the input is in *questions*
+    and is rounded UP to the next full set using ``SET_SIZES[section]``.
+
+    Returns 0 for non-positive inputs.
+    """
+    if n_input <= 0:
+        return 0
+    if not subtype:
+        return n_input
+    per_set = SET_SIZES.get(section, 1) or 1
+    return math.ceil(n_input / per_set)
 
 # IRT difficulty bands (Rasch logits). Predicted by Claude per question;
 # refined when student response data accumulates.

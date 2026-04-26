@@ -349,6 +349,44 @@ def test_drift_vr_missing_minigame_kind_flags_drift():
     assert drift is not None
 
 
+# ─── Set-count math helper ───────────────────────────────────────────────────
+
+from ucat.config import compute_set_count
+
+
+def test_compute_set_count_no_subtype_returns_input():
+    """Without subtype, quantity is already 'sets' — no conversion."""
+    assert compute_set_count(10, "DM", subtype=None) == 10
+    assert compute_set_count(1,  "VR", subtype=None) == 1
+
+
+def test_compute_set_count_dm_questions_round_up():
+    # DM has 5 questions/set
+    assert compute_set_count(10, "DM", subtype="venn") == 2     # 10/5 = 2 exact
+    assert compute_set_count(7,  "DM", subtype="venn") == 2     # ceil(7/5) = 2
+    assert compute_set_count(11, "DM", subtype="venn") == 3     # ceil(11/5) = 3
+    assert compute_set_count(1,  "DM", subtype="venn") == 1     # ceil(1/5) = 1
+
+
+def test_compute_set_count_vr_questions_round_up():
+    # VR has 4 questions/set
+    assert compute_set_count(8,  "VR", subtype="main-idea") == 2  # 8/4 = 2 exact
+    assert compute_set_count(13, "VR", subtype="main-idea") == 4  # ceil(13/4) = 4
+
+
+def test_compute_set_count_qr_questions_round_up():
+    # QR has 4 questions/set
+    assert compute_set_count(5, "QR", subtype="bar") == 2          # ceil(5/4) = 2
+
+
+def test_compute_set_count_zero_returns_zero():
+    assert compute_set_count(0, "DM", subtype="venn") == 0
+
+
+def test_compute_set_count_negative_returns_zero():
+    assert compute_set_count(-3, "DM", subtype="venn") == 0
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
