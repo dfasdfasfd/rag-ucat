@@ -36,6 +36,12 @@ class CoverageTags(BaseModel):
     cultural_context: Optional[str] = None  # e.g. "UK", "general", "non-Western"
 
 
+# Path-C addition: coarse "how close are the wrong answers" signal that
+# combines with `solve_steps` to give downstream calibration a stable
+# basis for difficulty inference. See enricher's COMMON FIELDS reminder.
+DistractorProximity = Literal["near", "moderate", "far"]
+
+
 class OptionItem(BaseModel):
     """One answer choice. Modelled as a struct (not a Dict[str, str]) because
     Anthropic strict mode rejects ``additionalProperties: <schema>`` map types.
@@ -54,8 +60,8 @@ class Question(BaseModel):
         default=None,
         description=(
             "Pocket UCAT routing tag. For VR subtype targeting: one of "
-            "'tfc', 'main-idea', 'paraphrase', 'tone-purpose', 'inference'. "
-            "Optional — legacy rows and mixed-mode runs may leave this null."
+            "'tfc', 'main-idea', 'paraphrase', 'tone-purpose', 'inference', "
+            "'vocabulary', 'application'. Optional — legacy rows and mixed-mode runs may leave this null."
         ),
     )
     options: List[OptionItem] = Field(
@@ -73,6 +79,36 @@ class Question(BaseModel):
     difficulty: float = Field(ge=1.0, le=5.0,
                               description="IRT logits on the 1.0-5.0 scale.")
     coverage: CoverageTags
+
+    # Path-C generic enrichment fields (audit-3 M1 + M2). Replace Claude's
+    # noisy 1.0-5.0 difficulty guess by giving the calibrator less-noisy
+    # raw inputs (`solve_steps` + `distractor_proximity`); downstream IRT
+    # and judge-blending stay backward-compatible while the new fields
+    # arrive. `common_mistake` carries error-pattern hints lifted from
+    # the explanation panel — feeds distractor generation.
+    solve_steps: Optional[int] = Field(
+        default=None, ge=0, le=20,
+        description=(
+            "Coarse complexity proxy. QR: arithmetic-op count. DM: inference-hop count. "
+            "VR: distinct passage references the candidate must reconcile. SJT: usually 1-2."
+        ),
+    )
+    distractor_proximity: Optional[DistractorProximity] = Field(
+        default=None,
+        description=(
+            "How close the wrong answers cluster to the right one. "
+            "'near' = within ~10% numerically or differs by one logical clause. "
+            "'far' = obviously wrong by inspection. 'moderate' = anything between."
+        ),
+    )
+    common_mistake: Optional[str] = Field(
+        default=None,
+        description=(
+            "Typical error pattern lifted from the explanation panel "
+            "(e.g. 'candidates often divide instead of multiplying'). "
+            "Pure gold for distractor generation downstream."
+        ),
+    )
 
     @field_validator("options", mode="before")
     @classmethod
@@ -125,7 +161,11 @@ class ARSet(BaseModel):
 
 # QR — quantitative reasoning data stimulus.
 
-QRChartType = Literal["table", "bar", "line", "stacked_bar", "pie"]
+# `matrix` added in Path-C (audit-3 H3) to support transition tables /
+# cross-tabs (voter transitions, contingency tables) where both axes
+# carry meaningful categories — collapsing them into categories+series
+# loses dual-axis semantics.
+QRChartType = Literal["table", "bar", "line", "stacked_bar", "pie", "matrix"]
 
 
 class QRSeries(BaseModel):
@@ -146,11 +186,41 @@ class QRTableColumn(BaseModel):
     )
 
 
+class QRMatrix(BaseModel):
+    """A 2-D cross-tabulation with meaningful row AND column axes.
+
+    Used for transition tables (e.g. voter transitions April→September),
+    contingency tables, dose × outcome cross-tabs. The 1-D `categories +
+    series + rows` representation flattens dual-axis semantics; this
+    struct preserves them so the verifier and renderer can reason about
+    "row R, column C" cells directly.
+    """
+    model_config = ConfigDict(extra="forbid")
+    row_axis_label: str
+    col_axis_label: str
+    row_categories: List[str] = Field(min_length=2)
+    col_categories: List[str] = Field(min_length=2)
+    cells: List[List[Union[str, float]]] = Field(
+        description="2-D array indexed [row_i][col_j].",
+    )
+    row_totals: Optional[List[Union[str, float]]] = None
+    col_totals: Optional[List[Union[str, float]]] = None
+
+
 class QRChart(BaseModel):
     type: QRChartType
     title: str
     x_label: Optional[str] = None
     y_label: Optional[str] = None
+    # Path-C: explicit axis units (audit-3 H3) — lets `symbolic_qr_check`
+    # validate cross-references like "in 2022" against x_axis values
+    # without inferring the unit from prose.
+    axis_units_x: Optional[str] = None
+    axis_units_y: Optional[str] = None
+    # Y-axis gridline interval, when readable. Lets the verifier
+    # re-validate extracted values within ±half-gridline of the bar's
+    # visible height, catching off-by-one chart misreads.
+    gridline_interval: Optional[float] = None
     categories: List[str] = Field(default_factory=list,
                                     description="X-axis categories or pie segment labels.")
     series: List[QRSeries] = Field(default_factory=list,
@@ -162,8 +232,19 @@ class QRChart(BaseModel):
             "List of {name, values} columns; values length must match categories length."
         ),
     )
+    matrix: Optional[QRMatrix] = Field(
+        default=None,
+        description=(
+            "Cross-tabulation form ONLY (matrix-typed charts). "
+            "Use when the figure is a 2-D grid with meaningful labels on both axes."
+        ),
+    )
     units: Optional[str] = None  # e.g. "£000s", "%"
     note: Optional[str] = None   # optional caption
+    # Path-C: source attribution / asterisk-marked footnotes lifted from
+    # the chart caption area. Often-overlooked context — e.g.
+    # "*excludes weekends", "Source: ONS 2022".
+    footnotes: List[str] = Field(default_factory=list)
 
     @field_validator("rows", mode="before")
     @classmethod
@@ -185,10 +266,36 @@ class QRChart(BaseModel):
         return {col.name: list(col.values) for col in rows}
 
 
+# QR-specific skill taxonomy (audit-3 H1) — primary axis for retrieval
+# diversification. Free-text `coverage.topic` stays as secondary annotation.
+QRSkillTag = Literal[
+    "ratio-percent",
+    "mean-aggregate",
+    "drug-dosage",
+    "unit-conversion",
+    "geometry-area",
+    "prob-frequency",
+    "compound-growth",
+    "data-readout",
+    "speed-distance-time",
+    "scaling-extrapolation",
+]
+
+
+class QRQuestion(Question):
+    """QR extends Question with a closed skill_tag enum so retrieval can
+    diversify on a stable axis (free-text `topic` cardinality explodes
+    and rarely matches). Optional for back-compat with pre-Path-C rows."""
+    skill_tag: Optional[QRSkillTag] = None
+
+
 class QRSet(BaseModel):
     section: Literal["QR"]
     stimulus: QRChart
-    questions: List[Question] = Field(min_length=4, max_length=4)
+    # Path-C: some QR questions reference TWO charts (e.g. "compare the
+    # patient census on chart 1 with the staffing rota on chart 2").
+    additional_stimuli: Optional[List[QRChart]] = None
+    questions: List[QRQuestion] = Field(min_length=4, max_length=4)
 
 
 # DM — Decision Making with optional venn structure.
@@ -204,9 +311,36 @@ class DMVenn(BaseModel):
     universe_label: Optional[str] = None
 
 
+# DM-specific skill taxonomy (audit-3 H1) — primary axis for retrieval.
+DMSkillTag = Literal[
+    "syllogism-conditional",
+    "syllogism-quantifier",
+    "venn-2set",
+    "venn-3set",
+    "prob-conditional",
+    "prob-tree",
+    "argument-strength",
+    "recognise-assumption",
+    "logical-puzzle",
+    "interpreting-information",
+]
+
+
 class DMQuestion(Question):
-    """DM extends Question with optional structured venn data."""
+    """DM extends Question with optional structured venn data and a
+    skill_tag for retrieval diversification."""
     venn: Optional[DMVenn] = None
+    skill_tag: Optional[DMSkillTag] = None
+    # For syllogism-typed questions in Pearson's per-conclusion Yes/No
+    # layout: parallel array to `options` indicating each conclusion's
+    # ground-truth Yes/No verdict (audit-3 H2). Surfaces the full Yes/No
+    # signal that the answer letter alone discards (4 of 5 verdicts in
+    # the typical 5-conclusion layout).
+    conclusion_validity: Optional[List[Literal["yes", "no"]]] = Field(
+        default=None,
+        min_length=2,
+        max_length=8,
+    )
 
 
 class DMSet(BaseModel):
@@ -216,13 +350,99 @@ class DMSet(BaseModel):
 
 # VR — pure text passage; no visuals.
 
+# UCAT VR question kinds — drives subtype-locked retrieval and bulk
+# variety steering. The role block uses these names; the trainer's
+# generated VR docs include them. Crawler-imported docs may not — they
+# fall back to `Question.type` (tf/mc) which is a structurally-narrower
+# axis than the kind taxonomy.
+VRMinigameKind = Literal[
+    "tfc",          # True / False / Can't Tell statements
+    "main-idea",    # central thesis / best title / overall conclusion
+    "paraphrase",   # which option restates a quoted passage fragment
+    "tone-purpose", # author tone, attitude, rhetorical purpose
+    "inference",    # what can be concluded from the passage
+    "vocabulary",   # word substitution / lexical knowledge (audit-3 M4)
+    "application",  # transfer the argument to a new scenario (audit-3 M4)
+]
+
+
+class VRQuestion(Question):
+    """VR extends Question with an optional minigame_kind tag — a narrower
+    classification than the inherited `type: tf|mc`. Generation always
+    emits this; legacy crawler-imported docs may omit it (they have only
+    the broader `type` field). Used by retrieval subtype filtering and
+    coverage diversification."""
+    minigame_kind: Optional[VRMinigameKind] = None
+
+
 class VRSet(BaseModel):
     section: Literal["VR"]
     passage: str
-    questions: List[Question] = Field(min_length=4, max_length=4)
+    questions: List[VRQuestion] = Field(min_length=4, max_length=4)
 
 
-SECTION_MODELS = {"VR": VRSet, "DM": DMSet, "QR": QRSet, "AR": ARSet}
+# SJT — workplace/clinical scenario; pure text, no visuals.
+
+SJTQuestionType = Literal["appropriateness", "importance"]
+
+# UCAT SJT scenarios fall into recognisable situation families. Tracking
+# this on the set lets `pick_diversification` steer bulk runs across
+# situation types — without it, a 10-set bulk run can produce 9 medical-
+# ethics scenarios and 0 boundary-management ones.
+#
+# Path-C expansion (audit-3 M3): real captures show 4 categories missing
+# from the original 4-value enum. Now 8 values.
+SJTSituationType = Literal[
+    "medical_ethics",            # informed consent, end-of-life, confidentiality
+    "team_conflict",             # disagreement with colleague / senior
+    "boundary_management",       # scope of practice, dual relationships, gifts
+    "professional_communication", # handover, error reporting, breaking bad news
+    "personal_wellbeing",        # colleague struggling, candidate's own welfare
+    "student_supervision",       # teaching, supervising, mentoring junior staff
+    "consent_capacity",          # capacity assessment, refusal of treatment
+    "resource_allocation",       # triage, rationing, time-critical prioritisation
+]
+
+# SJT-specific skill taxonomy (audit-3 H1).
+SJTSkillTag = Literal[
+    "consent-capacity",
+    "confidentiality",
+    "error-disclosure",
+    "team-conflict",
+    "boundary-management",
+    "wellbeing",
+    "priorities",
+    "patient-safety",
+    "honesty-integrity",
+    "resource-stewardship",
+]
+
+
+class SJTQuestion(Question):
+    """SJT extends Question with an optional sub-type tag identifying whether
+    the question is appropriateness-style (rate a candidate action) or
+    importance-style (rate a consideration). Claude classifies this during
+    enrichment when the question wording makes it unambiguous."""
+    type: Optional[SJTQuestionType] = None  # narrows the inherited str type
+    skill_tag: Optional[SJTSkillTag] = None
+    # Position of the marked answer on the canonical Likert ordering
+    # (1=top "Very appropriate"/"Very important", 4=opposite end).
+    # Lets verification compute partial-credit (adjacent label = partial)
+    # without re-deriving from prose (audit-3 M5).
+    likert_rank: Optional[int] = Field(default=None, ge=1, le=4)
+
+
+class SJTSet(BaseModel):
+    section: Literal["SJT"]
+    scenario: str = Field(min_length=1)
+    # Situation-type tag for diversification tracking. Optional for back-
+    # compat with crawler-imported SJT sets that pre-date this field;
+    # generation produced post-fix should always set it.
+    situation_type: Optional[SJTSituationType] = None
+    questions: List[SJTQuestion] = Field(min_length=4, max_length=4)
+
+
+SECTION_MODELS = {"VR": VRSet, "DM": DMSet, "QR": QRSet, "AR": ARSet, "SJT": SJTSet}
 
 # ─── Verifier outputs ────────────────────────────────────────────────────────
 
