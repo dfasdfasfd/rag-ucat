@@ -5,15 +5,17 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from .config import (DEFAULT_VERIFY_LLM, DEFAULT_JUDGE2_LLM, IRT_BANDS,
+                       PRIMARY_JUDGE_BY_SECTION,
                       Settings, SECTIONS, SECTION_DESC, difficulty_label,
                       SUBTYPES_BY_SECTION)
 from .calibration import calibrate_set, difficulty_distance
 from .coverage import aggregate_set
 from .db import Database, embed_text_for
-from .llm import embed_batch, embed_query, generate_structured, merge_usage
+from .llm import embed_batch, embed_doc, embed_query, generate_structured, merge_usage
 from .models import SECTION_MODELS
 from .telemetry import emit, logger, trace
 from .verification import jury_verify, llm_judge, symbolic_qr_check
@@ -75,6 +77,22 @@ class RAGEngine:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
         self.settings = settings
+        # Single-worker executor for async verify tasks. Replaces the previous
+        # per-call `threading.Thread` spawn + lets us cancel pending verifies
+        # and shut down cleanly. `max_workers=1` is intentional: verify tasks
+        # don't benefit from running in parallel (each one already
+        # parallelises 2 judges internally via verification.py's TPE), and a
+        # single worker avoids surprising concurrent DB writes on the
+        # generated table.
+        self._verify_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rag-verify"
+        )
+        # Tracks not-yet-completed verify futures so callers can cancel
+        # pending ones (only effective for futures that haven't started yet —
+        # in-flight Claude calls run to completion).
+        self._verify_futures: Set[Future] = set()
+        self._verify_lock = threading.Lock()
+        self._cancelled = False
 
     @property
     def llm(self):           return self.settings.get("llm")
@@ -115,13 +133,26 @@ class RAGEngine:
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
-    def retrieve(self, section: str, hint: str = ""):
+    def retrieve(
+        self,
+        section: str,
+        hint: str = "",
+        subtype: Optional[str] = None,
+        target_difficulty: Optional[float] = None,
+    ):
+        # Bake subtype into the query string so the embedding anchor lands
+        # closer to subtype-matching KB docs even before the SQL pre-filter
+        # narrows the pool. (Example: "UCAT Decision Making venn: ..." pulls
+        # cleaner venn-heavy retrievals than "UCAT Decision Making: ...".)
+        prefix = f"UCAT {SECTIONS[section]}"
+        if subtype:
+            prefix += f" {subtype}"
         if hint.strip():
-            query = f"UCAT {SECTIONS[section]}: {hint.strip()}"
+            query = f"{prefix}: {hint.strip()}"
         else:
-            query = f"UCAT {SECTIONS[section]} typical exam-style question"
+            query = f"{prefix} typical exam-style question"
 
-        with trace("retrieve", section=section, hint_len=len(hint)) as t:
+        with trace("retrieve", section=section, hint_len=len(hint), subtype=subtype) as t:
             try:
                 qvec = embed_query(query, self.emb)
             except Exception as e:
@@ -131,7 +162,10 @@ class RAGEngine:
                 random.shuffle(docs)
                 t["fallback"] = "random"
                 return None, [(0.0, d) for d in docs[:self.top_k]]
-            results = self.db.retrieve(section, qvec, self.top_k, self.mmr_lambda)
+            results = self.db.retrieve(
+                section, qvec, self.top_k, self.mmr_lambda,
+                subtype=subtype, target_difficulty=target_difficulty,
+            )
             t["retrieved_ids"] = [d["id"] for _, d in results]
             t["retrieved_count"] = len(results)
             return qvec, results
@@ -143,11 +177,18 @@ class RAGEngine:
                         subtype: Optional[str] = None) -> List[Dict[str, Any]]:
         """Build cache-friendly system blocks.
 
-          [0] Frozen role + structural description + retrieved KB     (CACHED)
-          [1] Per-request difficulty + variation guidance              (NOT CACHED)
+          [0] Frozen role + structural description           (CACHED — stable)
+          [1] Retrieved KB examples                          (NOT CACHED — varies per call)
+          [2] Per-request difficulty + variation guidance    (NOT CACHED)
 
-        When ``subtype`` is set, the section-specific block is replaced with
-        a lock-in that forces every question (or, for QR, the stimulus chart)
+        Why the split: putting `cache_control` on a block that includes the
+        retrieved examples invalidates the cache on almost every call (the
+        retrieved set changes with the query). Caching only the stable role
+        block lets the ~2KB role text hit cache on every subsequent call
+        within a section, saving ~90% of the input tokens for that block.
+
+        When ``subtype`` is set, the role block is augmented with a
+        lock-in that forces every question (or, for QR, the stimulus chart)
         to that subtype.
         """
         role = (
@@ -158,9 +199,11 @@ class RAGEngine:
             "• Every question's answer must be derivable from the passage / stimulus / rules.\n"
             "• Distractors must be plausible — each wrong option should reflect a realistic mistake.\n"
             "• `options` MUST be a non-empty ARRAY of {\"label\": ..., \"text\": ...} objects, in display order:\n"
-            "    - VR / QR multiple choice → 4 items with labels \"A\", \"B\", \"C\", \"D\".\n"
+            "    - VR multiple choice → 4 items with labels \"A\", \"B\", \"C\", \"D\".\n"
             "    - VR True/False/Can't Tell items → 3 items with labels exactly \"True\", \"False\", \"Can't Tell\".\n"
+            "    - QR → 5 numerical items with labels \"A\", \"B\", \"C\", \"D\", \"E\".\n"
             "    - DM → 5 items with labels \"A\", \"B\", \"C\", \"D\", \"E\".\n"
+            "    - SJT → 4 Likert-scale items with labels \"A\", \"B\", \"C\", \"D\".\n"
             "    - AR test items → 3 items with labels \"Set A\", \"Set B\", \"Neither\".\n"
             "  Never emit an empty `options` array. Never reference option text only inside `explanation`.\n"
             "• `answer` MUST be one of the option labels you emitted in `options[*].label`.\n"
@@ -228,6 +271,40 @@ class RAGEngine:
                 f"{kind_reminders.get(subtype, '')}\n"
             )
 
+        if section == "SJT":
+            role += (
+                "\nCRITICAL — SJT scoring is rubric-based, not single-correct-answer. "
+                "Set `answer` to the option label that best aligns with UCAT's marking "
+                "guidance — weighted toward professionalism, patient safety, honesty, "
+                "team-working, and scope-of-practice. The answer is the most "
+                "appropriate option per UCAT principles, NOT an objectively correct one.\n\n"
+                "Likert label rules:\n"
+                "  - Appropriateness questions use exactly: 'Very appropriate', "
+                "'Appropriate but not ideal', 'Inappropriate but not awful', "
+                "'Very inappropriate'.\n"
+                "  - Importance questions use exactly: 'Very important', 'Important', "
+                "'Of minor importance', 'Not important at all'.\n"
+                "Each question's `type` MUST be 'appropriateness' or 'importance'. The "
+                "4 questions in a set may mix these types — that's expected.\n\n"
+                "Set the SJTSet's `situation_type` field to one of the four UCAT "
+                "situation families:\n"
+                "  - 'medical_ethics': informed consent, end-of-life care, "
+                "confidentiality breaches, patient autonomy.\n"
+                "  - 'team_conflict': disagreement with a colleague or senior, peer "
+                "behaviour concerns, hierarchy navigation.\n"
+                "  - 'boundary_management': scope of practice, dual relationships "
+                "with patients, gifts, social-media boundaries.\n"
+                "  - 'professional_communication': handover, error reporting, "
+                "breaking bad news, disclosure.\n"
+                "Avoid scenarios where the 'right' answer is culturally obvious "
+                "without UCAT principles.\n"
+            )
+            if subtype:
+                # Subtype lock-in for bulk runs requesting only one type.
+                role += (
+                    f"\nAll 4 questions MUST set `type: '{subtype}'`.\n"
+                )
+
         if section == "DM":
             if subtype:
                 # Subtype override: replace the variety guidance with a lock-in.
@@ -248,8 +325,17 @@ class RAGEngine:
                     "\nFor venn-type DM questions, include a structured `venn` field with "
                     "2 or 3 sets so the diagram can be rendered. For other DM subtypes, "
                     "leave `venn` null.\n"
-                    "Aim for variety: include syllogism, logical, venn, probability, AND "
-                    "argument subtypes across the 5 questions — one of each is ideal.\n"
+                    "MANDATORY VARIETY — UCAT mixed DM sets feature one of each of the 5 "
+                    "subtypes. Set `type` per question as follows:\n"
+                    "  • Q1: syllogism\n"
+                    "  • Q2: logical (clue-based deduction)\n"
+                    "  • Q3: venn (with structured `venn` field)\n"
+                    "  • Q4: probability\n"
+                    "  • Q5: argument (strongest argument for/against)\n"
+                    "Default to this 1-of-each lineup. Only deviate if the user's hint "
+                    "explicitly requests otherwise. Do NOT cluster on syllogism — "
+                    "Claude's training data is syllogism-heavy and post-hoc coverage "
+                    "checks flag any subtype that appears 4+ times in a set.\n"
                 )
 
         ex_text = ""
@@ -273,10 +359,16 @@ class RAGEngine:
             "Include some easier and some harder items around that mean.\n"
         )
 
-        return [
-            {"type": "text", "text": role + ex_text, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": diff},
+        # Cache only the stable role block. Retrieved examples and the
+        # per-call difficulty header sit AFTER the breakpoint so they don't
+        # bust the cache when the query changes.
+        blocks: List[Dict[str, Any]] = [
+            {"type": "text", "text": role, "cache_control": {"type": "ephemeral"}},
         ]
+        if ex_text:
+            blocks.append({"type": "text", "text": ex_text})
+        blocks.append({"type": "text", "text": diff})
+        return blocks
 
     def generate(
         self,
@@ -287,7 +379,6 @@ class RAGEngine:
         on_progress: Optional[Callable[[str], None]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
         on_verify_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
-        variation_seed: Optional[str] = None,
         force_scenario: Optional[str] = None,
         avoid_topics: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
@@ -312,7 +403,9 @@ class RAGEngine:
                    subtype=subtype) as t:
 
             if on_progress: on_progress("Embedding retrieval query…")
-            qvec, retrieved = self.retrieve(section, hint)
+            qvec, retrieved = self.retrieve(
+                section, hint, subtype=subtype, target_difficulty=target,
+            )
 
             if on_progress: on_progress(f"Retrieved {len(retrieved)} doc(s). Building prompt…")
             system_blocks = self._system_blocks(section, retrieved, target,
@@ -338,8 +431,11 @@ class RAGEngine:
                     f"DIVERSITY DIRECTIVE: avoid these recently-overused topics: "
                     f"{shown}. Pick a different subject. "
                 )
-            if variation_seed:
-                user_parts.append(f"Variation seed for stylistic diversity: {variation_seed}. ")
+            # Note: a `variation_seed` kwarg used to live here but it was
+            # theatre — Claude has no mechanism to use an opaque hex string
+            # as actual sampling entropy. The real diversity levers are
+            # `force_scenario`, `avoid_topics`, and the rotating retrieval
+            # pool (different examples on each call).
 
             if subtype:
                 # Look up the human label so the prompt nudge reads naturally.
@@ -354,11 +450,22 @@ class RAGEngine:
 
             if on_progress: on_progress(f"Generating with {self.llm}…")
             model_cls = SECTION_MODELS[section]
-            with trace("generate", section=section, model=self.llm) as gt:
+            # Adaptive thinking on for sections that require multi-step
+            # reasoning. DM venn/probability questions and QR multi-step
+            # calculations show meaningful accuracy gains from Opus 4.7's
+            # adaptive thinking. VR (passage comprehension) and SJT (rubric
+            # alignment) are mostly single-step inference and don't
+            # benefit enough to justify the extra ~$0.01/call.
+            use_thinking = section in {"DM", "QR"}
+            with trace(
+                "generate", section=section, model=self.llm,
+                thinking=use_thinking,
+            ) as gt:
                 parsed, gen_usage = generate_structured(
                     system_blocks=system_blocks, user=user,
                     model=self.llm, output_schema=model_cls,
                     on_delta=on_delta, max_tokens=8000,
+                    thinking=use_thinking,
                 )
                 gt.update(gen_usage)
             data = parsed.model_dump()
@@ -424,7 +531,12 @@ class RAGEngine:
             if qvec is not None:
                 try:
                     gen_text = embed_text_for(data)
-                    gen_vec  = embed_query(gen_text, self.emb)
+                    # Dedup compares the freshly-generated doc against KB
+                    # docs (also embedded as documents). Use the document
+                    # input_type so both sides live in the same embedding
+                    # space — Voyage is asymmetric, so a query-space vector
+                    # would compare incorrectly against doc-space vectors.
+                    gen_vec  = embed_doc(gen_text, self.emb)
                     near = self.db.find_near_duplicates(section, gen_vec)
                     if near:
                         top_sim = max(s for s, _ in near)
@@ -442,16 +554,39 @@ class RAGEngine:
                                    coverage=coverage_dict,
                                    difficulty=set_difficulty)
 
-        # Spawn the async verify worker AFTER the trace closes so
-        # rag_generate's elapsed_ms reflects the user-visible wait. The worker
-        # has its own `verify_async` trace span.
-        if async_verify:
-            threading.Thread(
-                target=self._async_verify_worker,
-                args=(row_id, section, data, gen_usage, target,
-                      verdict_dict, on_verify_complete),
-                daemon=True,
-            ).start()
+        # Submit the async verify worker to the engine's executor AFTER the
+        # trace closes so rag_generate's elapsed_ms reflects the user-visible
+        # wait. The worker has its own `verify_async` trace span. Track the
+        # future so `cancel_pending_verifies()` and `shutdown()` can manage it.
+        #
+        # The `_cancelled` check below is racey by design: a UI shutdown can
+        # land between the check and submit(), so submit() can raise
+        # RuntimeError("cannot schedule new futures after shutdown"). We catch
+        # it explicitly rather than crashing the generate() caller — the
+        # verify is a fire-and-forget enhancement, not a correctness
+        # requirement, so silently dropping it on shutdown is correct.
+        if async_verify and not self._cancelled:
+            try:
+                fut = self._verify_executor.submit(
+                    self._async_verify_worker,
+                    row_id, section, data, gen_usage, target,
+                    verdict_dict, on_verify_complete,
+                )
+            except RuntimeError as err:
+                # Executor was shut down between our check and submit.
+                logger.info(
+                    "async verify skipped: executor shut down (row_id=%s): %s",
+                    row_id, err,
+                )
+            else:
+                with self._verify_lock:
+                    self._verify_futures.add(fut)
+                # Done-callback removes the future from the active set whether
+                # it completed normally, raised, or was cancelled.
+                def _release(f: Future, _self=self) -> None:
+                    with _self._verify_lock:
+                        _self._verify_futures.discard(f)
+                fut.add_done_callback(_release)
 
         return {
             "data":          data,
@@ -480,9 +615,23 @@ class RAGEngine:
         and surfaced as a soft "low confidence" verdict so generation never
         fails because verify did.
         """
+        # Section-specific primary judge: SJT uses Sonnet because rubric
+        # scoring is too subjective for Haiku; other sections stick with
+        # the cheap Haiku default.
+        primary_judge = PRIMARY_JUDGE_BY_SECTION.get(section, DEFAULT_VERIFY_LLM)
+
         if self.multi_judge:
             if on_progress: on_progress("Multi-judge jury verifying…")
-            judges = [DEFAULT_VERIFY_LLM, DEFAULT_JUDGE2_LLM, self.llm]
+            # Promote primary to first slot; tie-breaker is Sonnet (or, for
+            # SJT where Sonnet is already primary, fall through to Opus).
+            tiebreaker = (
+                self.llm if primary_judge == DEFAULT_JUDGE2_LLM else DEFAULT_JUDGE2_LLM
+            )
+            judges = [primary_judge, tiebreaker, self.llm]
+            # De-dup in case the user has llm=Sonnet and section=SJT —
+            # otherwise we'd run the same model twice.
+            seen: set[str] = set()
+            judges = [j for j in judges if not (j in seen or seen.add(j))]
             jury = jury_verify(section, data, judges=judges)
             verdict_dict: Dict[str, Any] = {
                 "mode": "jury",
@@ -495,11 +644,11 @@ class RAGEngine:
             }
             return verdict_dict, jury["judge_predictions"], jury["usage"]
 
-        if on_progress: on_progress("Verifying answers (Haiku)…")
+        if on_progress: on_progress(f"Verifying answers ({primary_judge.split('-')[1].title()})…")
         try:
-            v, vu = llm_judge(section, data, DEFAULT_VERIFY_LLM)
+            v, vu = llm_judge(section, data, primary_judge)
             verdict_dict = {"mode": "single",
-                              "judge": DEFAULT_VERIFY_LLM,
+                              "judge": primary_judge,
                               **v.model_dump()}
             judge_predictions = {pq.number: pq.difficulty for pq in v.per_question}
             return verdict_dict, judge_predictions, [vu]
@@ -575,3 +724,47 @@ class RAGEngine:
                 logger.exception("on_verify_complete callback failed")
         except Exception:
             logger.exception("Async verify worker failed for row_id=%s", row_id)
+
+    # ── Lifecycle: cancellation + shutdown ───────────────────────────────────
+
+    def cancel_pending_verifies(self) -> int:
+        """Best-effort cancellation of queued verify tasks.
+
+        Only futures that haven't started executing yet can be cancelled
+        (in-flight Claude calls run to completion). Returns the count of
+        successfully cancelled futures.
+
+        Use case: the user kicks off a bulk run and then closes the
+        dashboard. The UI calls this so queued verifies for already-saved
+        rows don't waste API spend on results no one will see.
+        """
+        cancelled = 0
+        with self._verify_lock:
+            futures = list(self._verify_futures)
+        for f in futures:
+            if f.cancel():
+                cancelled += 1
+        return cancelled
+
+    def shutdown(self, wait: bool = True, cancel_pending: bool = False) -> None:
+        """Tear down the async verify executor cleanly.
+
+        Args:
+            wait: If True, block until all currently-running verifies finish
+                  (default — preserves their results in the DB). If False,
+                  return immediately and let in-flight tasks finish in the
+                  background.
+            cancel_pending: If True, also cancel queued (not-yet-started)
+                  verifies before shutting down.
+
+        After shutdown, no new verifies can be submitted; `generate()` will
+        skip the verify spawn. Idempotent.
+        """
+        self._cancelled = True
+        if cancel_pending:
+            self.cancel_pending_verifies()
+        # Python 3.9+ accepts cancel_futures; older fallback below.
+        try:
+            self._verify_executor.shutdown(wait=wait, cancel_futures=cancel_pending)
+        except TypeError:
+            self._verify_executor.shutdown(wait=wait)

@@ -68,6 +68,7 @@ The retrieval query becomes: "UCAT Verbal Reasoning question about ecology"
     "questions": [
       {
         "number": 1, "text": "...", "type": "tf",
+        "minigame_kind": "tfc",
         "options": {"A": "True", "B": "False", "C": "Can't Tell"},
         "answer": "B", "explanation": "..."
       }
@@ -75,7 +76,21 @@ The retrieval query becomes: "UCAT Verbal Reasoning question about ecology"
   }
 ]
 
-Section codes: VR  DM  QR  AR
+Section codes: VR  DM  QR  SJT
+
+## minigame_kind
+
+Each question carries a `minigame_kind` tag that routes it into a specific
+Pocket UCAT minigame on the consumer side. Allowed values per section:
+
+- VR  : tfc, main-idea, paraphrase, tone-purpose, inference
+- DM  : syllogism, logic-grid, venn, probability, argument-strength, assumption
+- QR  : rapid-estimation, data-table, ratio, fraction, graph-grab, chart-sprint
+- SJT : appropriateness, importance, empathy, escalation, role-identification
+
+If `minigame_kind` is missing the Pocket UCAT importer falls back to keyword
+heuristics, so old generations remain valid — but populating it is preferred
+because the heuristic is ~70% accurate.
 
 ---
 

@@ -181,8 +181,12 @@ class QRTableColumn(BaseModel):
     ``{name: values}`` on dump for downstream rendering / verification."""
     model_config = ConfigDict(extra="forbid")
     name:   str = Field(description="Column header.")
-    values: List[Union[str, float]] = Field(
-        description="Cell values down the column, parallel to QRChart.categories (one per row).",
+    values: List[str] = Field(
+        description=(
+            "Cell values down the column as strings, parallel to QRChart.categories "
+            "(one per row). Numeric cells should be stringified (e.g. '12.5', '150'); "
+            "non-numeric cells like 'N/A' or '12.5%' are also allowed."
+        ),
     )
 
 
@@ -200,11 +204,14 @@ class QRMatrix(BaseModel):
     col_axis_label: str
     row_categories: List[str] = Field(min_length=2)
     col_categories: List[str] = Field(min_length=2)
-    cells: List[List[Union[str, float]]] = Field(
-        description="2-D array indexed [row_i][col_j].",
+    cells: List[List[str]] = Field(
+        description=(
+            "2-D array indexed [row_i][col_j]. Cell values as strings — "
+            "numerics should be stringified (e.g. '12.5')."
+        ),
     )
-    row_totals: Optional[List[Union[str, float]]] = None
-    col_totals: Optional[List[Union[str, float]]] = None
+    row_totals: Optional[List[str]] = None
+    col_totals: Optional[List[str]] = None
 
 
 class QRChart(BaseModel):
@@ -212,15 +219,6 @@ class QRChart(BaseModel):
     title: str
     x_label: Optional[str] = None
     y_label: Optional[str] = None
-    # Path-C: explicit axis units (audit-3 H3) — lets `symbolic_qr_check`
-    # validate cross-references like "in 2022" against x_axis values
-    # without inferring the unit from prose.
-    axis_units_x: Optional[str] = None
-    axis_units_y: Optional[str] = None
-    # Y-axis gridline interval, when readable. Lets the verifier
-    # re-validate extracted values within ±half-gridline of the bar's
-    # visible height, catching off-by-one chart misreads.
-    gridline_interval: Optional[float] = None
     categories: List[str] = Field(default_factory=list,
                                     description="X-axis categories or pie segment labels.")
     series: List[QRSeries] = Field(default_factory=list,
@@ -293,9 +291,6 @@ class QRQuestion(Question):
 class QRSet(BaseModel):
     section: Literal["QR"]
     stimulus: QRChart
-    # Path-C: some QR questions reference TWO charts (e.g. "compare the
-    # patient census on chart 1 with the staffing rota on chart 2").
-    additional_stimuli: Optional[List[QRChart]] = None
     questions: List[QRQuestion] = Field(min_length=4, max_length=4)
 
 

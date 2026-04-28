@@ -8,7 +8,129 @@ import re
 
 from src.config import (
     SECTION_SCHEMAS, SECTIONS, QUALITY_THRESHOLDS, DEFAULT_SCORER, cosine_sim,
+    MINIGAME_HINT_REQUIREMENTS,
 )
+
+
+# ─── Minigame Hint Validators ────────────────────────────────────────────────
+# Each validator returns a list of error strings (empty = valid).
+
+def _validate_inference_hints(h: dict) -> list:
+    statements = h.get("statements")
+    if not isinstance(statements, list) or len(statements) != 4:
+        return ["minigame_hints.statements: expected exactly 4 entries"]
+    errs = []
+    implied = 0
+    for i, s in enumerate(statements, 1):
+        if not isinstance(s, dict) or not s.get("text") or "is_implied" not in s:
+            errs.append(f"minigame_hints.statements[{i}]: needs {{text, is_implied}}")
+        elif s.get("is_implied") is True:
+            implied += 1
+    if implied != 1:
+        errs.append(f"minigame_hints.statements: expected exactly 1 with is_implied=true, got {implied}")
+    return errs
+
+
+def _validate_syllogism_hints(h: dict) -> list:
+    premises = h.get("premises")
+    if not isinstance(premises, list) or len(premises) != 3:
+        return ["minigame_hints.premises: expected exactly 3 string premises"]
+    if not all(isinstance(p, str) and p.strip() for p in premises):
+        return ["minigame_hints.premises: every premise must be a non-empty string"]
+    return []
+
+
+def _validate_argument_hints(h: dict) -> list:
+    args = h.get("arguments")
+    if not isinstance(args, list) or len(args) != 4:
+        return ["minigame_hints.arguments: expected exactly 4 entries"]
+    errs = []
+    valid_verdicts = {"strong", "weak", "irrelevant"}
+    for i, a in enumerate(args, 1):
+        if not isinstance(a, dict) or not a.get("text"):
+            errs.append(f"minigame_hints.arguments[{i}]: missing text")
+        elif a.get("verdict") not in valid_verdicts:
+            errs.append(f"minigame_hints.arguments[{i}]: verdict must be one of {sorted(valid_verdicts)}")
+    return errs
+
+
+def _validate_venn_hints(h: dict) -> list:
+    if not h.get("set_a") or not h.get("set_b"):
+        return ["minigame_hints: venn requires both set_a and set_b labels"]
+    items = h.get("items")
+    if not isinstance(items, list) or len(items) != 6:
+        return ["minigame_hints.items: expected exactly 6 entries"]
+    errs = []
+    valid_regions = {"A", "B", "both", "neither"}
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict) or not it.get("text"):
+            errs.append(f"minigame_hints.items[{i}]: missing text")
+        elif it.get("region") not in valid_regions:
+            errs.append(f"minigame_hints.items[{i}]: region must be one of {sorted(valid_regions)}")
+    return errs
+
+
+def _validate_data_table_hints(h: dict) -> list:
+    headers = h.get("headers")
+    rows = h.get("rows")
+    errs = []
+    if not isinstance(headers, list) or len(headers) < 2:
+        errs.append("minigame_hints.headers: expected ≥2 column names")
+    if not isinstance(rows, list) or len(rows) < 1:
+        errs.append("minigame_hints.rows: expected ≥1 row")
+    elif headers and isinstance(headers, list):
+        for i, row in enumerate(rows, 1):
+            if not isinstance(row, list) or len(row) != len(headers):
+                errs.append(f"minigame_hints.rows[{i}]: row width does not match headers")
+                break
+    return errs
+
+
+def _validate_role_id_hints(h: dict) -> list:
+    role = h.get("role")
+    if role not in ("doctor", "nurse", "student"):
+        return ["minigame_hints.role: must be 'doctor', 'nurse', or 'student'"]
+    actions = h.get("actions")
+    if not isinstance(actions, list) or len(actions) != 4:
+        return ["minigame_hints.actions: expected exactly 4 entries"]
+    errs = []
+    for i, a in enumerate(actions, 1):
+        if not isinstance(a, dict) or not a.get("text") or "in_role" not in a:
+            errs.append(f"minigame_hints.actions[{i}]: needs {{text, in_role}}")
+    return errs
+
+
+def _validate_values_sorter_hints(h: dict) -> list:
+    actions = h.get("actions")
+    if not isinstance(actions, list) or len(actions) != 6:
+        return ["minigame_hints.actions: expected exactly 6 entries"]
+    errs = []
+    valid_pillars = {"beneficence", "nonMaleficence", "justice", "autonomy"}
+    for i, a in enumerate(actions, 1):
+        if not isinstance(a, dict) or not a.get("text"):
+            errs.append(f"minigame_hints.actions[{i}]: missing text")
+        elif a.get("pillar") not in valid_pillars:
+            errs.append(f"minigame_hints.actions[{i}]: pillar must be one of {sorted(valid_pillars)}")
+    return errs
+
+
+_HINT_VALIDATORS = {
+    "inference": _validate_inference_hints,
+    "syllogism": _validate_syllogism_hints,
+    "argument-strength": _validate_argument_hints,
+    "venn": _validate_venn_hints,
+    "data-table": _validate_data_table_hints,
+    "role-identification": _validate_role_id_hints,
+    "values-sorter": _validate_values_sorter_hints,
+}
+
+
+def validate_minigame_hints(kind: str, hints: dict) -> list:
+    """Returns errors from the kind-specific validator, or [] if no validator."""
+    validator = _HINT_VALIDATORS.get(kind)
+    if not validator or not isinstance(hints, dict):
+        return []
+    return validator(hints)
 
 
 # ─── Session Dedup Cache ────────────────────────────────────────────────────
@@ -120,6 +242,26 @@ def validate_schema(data: dict, section: str) -> list:
             if valid_types and qtype and qtype not in valid_types:
                 errors.append(f"Q{qnum}: invalid type '{qtype}', expected one of {valid_types}")
 
+        # All sections: minigame_kind, when present, must match the section's catalogue.
+        # Missing minigame_kind is a warning (handled in validate_content), not an error,
+        # so old generations remain valid.
+        valid_kinds = schema.get("valid_minigame_kinds", [])
+        kind = q.get("minigame_kind")
+        if valid_kinds and kind and kind not in valid_kinds:
+            errors.append(
+                f"Q{qnum}: invalid minigame_kind '{kind}', expected one of {valid_kinds}"
+            )
+
+        # Structured hints: when minigame_kind requires hints, validate their shape.
+        # Missing hints is a warning (handled in validate_content); malformed hints
+        # are a hard error so the LLM gets a corrective retry.
+        if kind and kind in MINIGAME_HINT_REQUIREMENTS:
+            hints = q.get("minigame_hints")
+            if hints is not None:
+                hint_errs = validate_minigame_hints(kind, hints)
+                for he in hint_errs:
+                    errors.append(f"Q{qnum}: {he}")
+
     return errors
 
 
@@ -158,6 +300,30 @@ def validate_content(data: dict, section: str) -> list:
     missing_exp = sum(1 for q in questions if not q.get("explanation"))
     if missing_exp > 0:
         warnings.append(f"{missing_exp} question(s) missing explanations")
+
+    # Warn (don't error) if minigame_kind is missing — keeps old generations valid
+    # while nudging the LLM to populate the field on retry/new runs.
+    schema = SECTION_SCHEMAS.get(section, {})
+    if schema.get("valid_minigame_kinds"):
+        missing_kind = sum(1 for q in questions if not q.get("minigame_kind"))
+        if missing_kind > 0:
+            warnings.append(
+                f"{missing_kind} question(s) missing minigame_kind — Pocket UCAT importer "
+                "will fall back to keyword heuristics for those"
+            )
+
+    # Warn when a question's minigame_kind requires hints but none are provided.
+    # Without hints, the importer falls back to a generic MCQ rendering.
+    missing_hints = []
+    for q in questions:
+        kind = q.get("minigame_kind")
+        if kind in MINIGAME_HINT_REQUIREMENTS and not q.get("minigame_hints"):
+            missing_hints.append(f"Q{q.get('number', '?')}({kind})")
+    if missing_hints:
+        warnings.append(
+            "Missing minigame_hints (will render as generic MCQ): "
+            + ", ".join(missing_hints)
+        )
 
     return warnings
 

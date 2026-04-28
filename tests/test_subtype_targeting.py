@@ -80,7 +80,7 @@ from ucat.config import SET_SIZES, SUBTYPES_BY_SECTION
 def test_set_sizes_match_section_models():
     """SET_SIZES must match the min/max question count baked into the Pydantic
     section models so the ceil math in the bulk worker stays accurate."""
-    expected = {"VR": 4, "DM": 5, "QR": 4, "AR": 5}
+    expected = {"VR": 4, "DM": 5, "QR": 4, "AR": 5, "SJT": 4}
     assert SET_SIZES == expected, f"expected {expected}, got {SET_SIZES}"
 
 
@@ -135,7 +135,7 @@ def test_settings_defaults_include_bulk_subtype():
 def test_settings_defaults_include_per_section_subtype_memory():
     s = Settings(path=tempfile.mktemp(suffix=".json"))
     by_section = s.get("bulk_subtype_by_section")
-    assert by_section == {"VR": "", "DM": "", "QR": "", "AR": ""}, \
+    assert by_section == {"VR": "", "DM": "", "QR": "", "AR": "", "SJT": ""}, \
         f"unexpected default: {by_section!r}"
 
 

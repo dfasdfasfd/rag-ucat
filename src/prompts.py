@@ -8,7 +8,13 @@ import hashlib
 import json
 import re
 
-from src.config import SECTIONS, SECTION_SCHEMAS, SECTION_GEN_PARAMS
+from src.config import (
+    SECTIONS,
+    SECTION_SCHEMAS,
+    SECTION_GEN_PARAMS,
+    MINIGAME_KIND_DESCRIPTIONS,
+    MINIGAME_HINT_REQUIREMENTS,
+)
 
 
 # ─── Prompt Versioning ───────────────────────────────────────────────────────
@@ -123,6 +129,66 @@ SECTION_INSTRUCTIONS = {
 }
 
 
+def build_minigame_instructions(section: str) -> str:
+    """
+    Inject the section's valid `minigame_kind` catalogue into the prompt so the
+    LLM tags each question with the correct downstream minigame target. The
+    Pocket UCAT app uses these tags to route questions into specific minigame
+    formats (TFC, main-idea finder, paraphrase match, etc.).
+
+    For kinds that need richer structured data (syllogism premises, venn items,
+    table headers, role actions, etc.), also injects the `minigame_hints`
+    schema specific to that kind.
+    """
+    schema = SECTION_SCHEMAS.get(section, {})
+    kinds = schema.get("valid_minigame_kinds", [])
+    if not kinds:
+        return ""
+
+    lines = [
+        "## Minigame Tagging (REQUIRED)",
+        "Add a `minigame_kind` field to EVERY question. This tags the question",
+        f"for downstream rendering in the Pocket UCAT app. Allowed values for {section}:",
+    ]
+    for kind in kinds:
+        desc = MINIGAME_KIND_DESCRIPTIONS.get(kind, "")
+        lines.append(f"  - \"{kind}\" — {desc}" if desc else f"  - \"{kind}\"")
+    lines.append("")
+    lines.append("Choose the kind whose description best matches what the question is testing.")
+    if section == "VR":
+        lines.append(
+            "For VR specifically: type:'tf' questions ALWAYS use minigame_kind:'tfc'. "
+            "type:'mc' questions pick from main-idea, paraphrase, tone-purpose, or inference."
+        )
+    if section == "DM":
+        lines.append(
+            "For DM: keep `type` (syllogism/logical/venn/probability/argument) AND add "
+            "`minigame_kind`. The mapping is: syllogism→syllogism, logical→logic-grid, "
+            "venn→venn, probability→probability, argument→argument-strength."
+        )
+
+    # Structured hint requirements for kinds that need them
+    hint_kinds = [k for k in kinds if k in MINIGAME_HINT_REQUIREMENTS]
+    if hint_kinds:
+        lines.append("")
+        lines.append("## Structured Minigame Hints (REQUIRED for these kinds)")
+        lines.append(
+            "When using one of the kinds below, ALSO add a `minigame_hints` "
+            "object with the structured fields shown. These hints unlock richer "
+            "rendering in the app — without them the question falls back to a "
+            "generic MCQ presentation."
+        )
+        lines.append("")
+        for kind in hint_kinds:
+            req = MINIGAME_HINT_REQUIREMENTS[kind]
+            lines.append(f"### {kind}")
+            lines.append(req["description"])
+            lines.append(f"Example: `{req['shape']}`")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 # ─── Difficulty Descriptions ─────────────────────────────────────────────────
 
 def difficulty_desc(level: int = None) -> str:
@@ -151,6 +217,7 @@ class PromptBuilder:
         schema = SECTION_SCHEMAS[section]
         style_guide = extract_style_guide(retrieved_docs, section)
         section_instr = SECTION_INSTRUCTIONS.get(section, "")
+        minigame_instr = build_minigame_instructions(section)
         diff_desc = difficulty_desc(difficulty)
 
         # Format retrieved docs as context
@@ -173,6 +240,8 @@ Generate a completely new, original UCAT {SECTIONS[section]} question set.
 
 ## Section-Specific Requirements
 {section_instr}
+
+{minigame_instr}
 
 ## Difficulty
 {diff_desc}

@@ -47,12 +47,13 @@ SECTION_SCHEMAS = {
         ),
         "shape": (
             '{"section":"VR","passage":"...","questions":['
-            '{"number":1,"text":"...","type":"tf","options":{"A":"True","B":"False","C":"Can\'t Tell"},"answer":"A","explanation":"..."},'
-            '{"number":2,"text":"...","type":"mc","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"C","explanation":"..."}]}'
+            '{"number":1,"text":"...","type":"tf","minigame_kind":"tfc","options":{"A":"True","B":"False","C":"Can\'t Tell"},"answer":"A","explanation":"..."},'
+            '{"number":2,"text":"...","type":"mc","minigame_kind":"main-idea","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"C","explanation":"..."}]}'
         ),
         "required_keys": ["passage", "questions"],
         "question_count": 4,
         "min_passage_len": 100,
+        "valid_minigame_kinds": ["tfc", "main-idea", "paraphrase", "tone-purpose", "inference"],
     },
     "DM": {
         "desc": (
@@ -62,11 +63,14 @@ SECTION_SCHEMAS = {
         ),
         "shape": (
             '{"section":"DM","questions":['
-            '{"number":1,"type":"syllogism","text":"...","options":{"A":"...","B":"...","C":"...","D":"...","E":"..."},"answer":"B","explanation":"..."}]}'
+            '{"number":1,"type":"syllogism","minigame_kind":"syllogism","text":"...","options":{"A":"...","B":"...","C":"...","D":"...","E":"..."},"answer":"B","explanation":"..."}]}'
         ),
         "required_keys": ["questions"],
         "question_count": 5,
         "valid_types": ["syllogism", "logical", "venn", "probability", "argument"],
+        "valid_minigame_kinds": [
+            "syllogism", "logic-grid", "venn", "probability", "argument-strength", "assumption",
+        ],
     },
     "QR": {
         "desc": (
@@ -75,11 +79,14 @@ SECTION_SCHEMAS = {
         ),
         "shape": (
             '{"section":"QR","stimulus":"Title\\n\\n| Col | Col |\\n|-----|-----|\\n| val | val |",'
-            '"questions":[{"number":1,"text":"...","options":{"A":"12","B":"14","C":"16","D":"18","E":"20"},"answer":"C","explanation":"step...=16"}]}'
+            '"questions":[{"number":1,"text":"...","minigame_kind":"data-table","options":{"A":"12","B":"14","C":"16","D":"18","E":"20"},"answer":"C","explanation":"step...=16"}]}'
         ),
         "required_keys": ["stimulus", "questions"],
         "question_count": 4,
         "min_stimulus_len": 20,
+        "valid_minigame_kinds": [
+            "rapid-estimation", "data-table", "ratio", "fraction", "graph-grab", "chart-sprint",
+        ],
     },
     "SJT": {
         "desc": (
@@ -89,13 +96,149 @@ SECTION_SCHEMAS = {
         ),
         "shape": (
             '{"section":"SJT","scenario":"...",'
-            '"questions":[{"number":1,"text":"...","options":{"A":"...","B":"...","C":"...","D":"..."},'
+            '"questions":[{"number":1,"text":"...","minigame_kind":"appropriateness","options":{"A":"...","B":"...","C":"...","D":"..."},'
             '"answer":"A","appropriateness":["most","appropriate","inappropriate","most_inappropriate"],"explanation":"..."}]}'
         ),
         "required_keys": ["scenario", "questions"],
         "question_count": 4,
         "min_scenario_len": 50,
+        "valid_minigame_kinds": [
+            "appropriateness", "importance", "empathy", "escalation", "role-identification",
+        ],
     },
+}
+
+# ─── Minigame Kind Catalogue ─────────────────────────────────────────────────
+# All valid `minigame_kind` values, exposed for prompt injection so the LLM
+# is told the exact accepted vocabulary at generation time.
+
+ALL_MINIGAME_KINDS = sorted({
+    k for sch in SECTION_SCHEMAS.values() for k in sch.get("valid_minigame_kinds", [])
+})
+
+# Structured hint requirements per minigame kind. Kinds in this dict need
+# extra fields under `minigame_hints` to render correctly in the Pocket UCAT
+# app. Kinds NOT in this dict are pure MCQs and need no hints.
+MINIGAME_HINT_REQUIREMENTS = {
+    "inference": {
+        "description": (
+            "List exactly 4 candidate statements about the passage; tag each as "
+            "directly stated (is_implied: false) or implied (is_implied: true). "
+            "Exactly ONE should be implied."
+        ),
+        "shape": (
+            '"minigame_hints":{"statements":['
+            '{"text":"Statement 1","is_implied":false},'
+            '{"text":"Statement 2","is_implied":true},'
+            '{"text":"Statement 3","is_implied":false},'
+            '{"text":"Statement 4","is_implied":false}]}'
+        ),
+    },
+    "syllogism": {
+        "description": (
+            "Provide exactly 3 premises as a separate array. The standard 4-5 "
+            "options remain as conclusion choices."
+        ),
+        "shape": (
+            '"minigame_hints":{"premises":['
+            '"All A are B.","Some C are A.","Therefore..."]}'
+        ),
+    },
+    "argument-strength": {
+        "description": (
+            "Provide exactly 4 arguments, each tagged 'strong', 'weak', or "
+            "'irrelevant' for the proposition in the question text."
+        ),
+        "shape": (
+            '"minigame_hints":{"arguments":['
+            '{"text":"Argument 1","verdict":"strong"},'
+            '{"text":"Argument 2","verdict":"weak"},'
+            '{"text":"Argument 3","verdict":"irrelevant"},'
+            '{"text":"Argument 4","verdict":"weak"}]}'
+        ),
+    },
+    "venn": {
+        "description": (
+            "Provide both set labels and exactly 6 items, each placed in one of: "
+            "'A' (only set A), 'B' (only set B), 'both', or 'neither'."
+        ),
+        "shape": (
+            '"minigame_hints":{"set_a":"Set A label","set_b":"Set B label",'
+            '"items":[{"text":"Item 1","region":"A"},{"text":"Item 2","region":"B"},'
+            '{"text":"Item 3","region":"both"},{"text":"Item 4","region":"neither"},'
+            '{"text":"Item 5","region":"A"},{"text":"Item 6","region":"both"}]}'
+        ),
+    },
+    "data-table": {
+        "description": (
+            "Provide the table as structured data: an array of column headers "
+            "and a 2-D array of cell strings (one entry per row). Keep the "
+            "options for the question itself (4 entries; one isCorrect)."
+        ),
+        "shape": (
+            '"minigame_hints":{"title":"Table title",'
+            '"headers":["Col 1","Col 2","Col 3"],'
+            '"rows":[["a","1","x"],["b","2","y"],["c","3","z"]]}'
+        ),
+    },
+    "role-identification": {
+        "description": (
+            "Provide the role being evaluated and exactly 4 candidate actions, "
+            "each tagged in_role: true/false."
+        ),
+        "shape": (
+            '"minigame_hints":{"role":"doctor",'
+            '"actions":[{"text":"Action 1","in_role":true},'
+            '{"text":"Action 2","in_role":false},'
+            '{"text":"Action 3","in_role":true},'
+            '{"text":"Action 4","in_role":false}]}'
+        ),
+    },
+    "values-sorter": {
+        "description": (
+            "Provide exactly 6 actions, each tagged with one of the four medical "
+            "ethics pillars: 'beneficence', 'nonMaleficence', 'justice', 'autonomy'."
+        ),
+        "shape": (
+            '"minigame_hints":{"actions":['
+            '{"text":"Action 1","pillar":"beneficence"},'
+            '{"text":"Action 2","pillar":"nonMaleficence"},'
+            '{"text":"Action 3","pillar":"justice"},'
+            '{"text":"Action 4","pillar":"autonomy"},'
+            '{"text":"Action 5","pillar":"beneficence"},'
+            '{"text":"Action 6","pillar":"justice"}]}'
+        ),
+    },
+}
+
+
+MINIGAME_KIND_DESCRIPTIONS = {
+    # VR
+    "tfc": "True / False / Can't Tell — pick the verdict based on the passage",
+    "main-idea": "Pick the option that best captures the passage's central message",
+    "paraphrase": "Pick the option that most accurately restates information from the passage",
+    "tone-purpose": "Identify the author's tone, intent, or purpose",
+    "inference": "Pick the implied (vs directly stated) statement",
+    # DM
+    "syllogism": "Apply deductive reasoning to premises to pick the valid conclusion",
+    "logic-grid": "Solve a clue-based grid (seating, ordering, matching)",
+    "venn": "Categorise items by set membership / overlap",
+    "probability": "Calculate or compare probabilities",
+    "argument-strength": "Rate arguments as strong, weak, or irrelevant for a proposition",
+    "assumption": "Identify the unstated assumption underpinning an argument",
+    # QR
+    "rapid-estimation": "Approximate a numerical answer under time pressure",
+    "data-table": "Read a table to answer a calculation question",
+    "ratio": "Solve a ratio or proportion problem",
+    "fraction": "Convert, compare, or compute with fractions",
+    "graph-grab": "Read a chart/graph to answer a calculation question",
+    "chart-sprint": "Quickly extract a value from a bar/pie/line chart",
+    # SJT
+    "appropriateness": "Rate how appropriate a proposed action is",
+    "importance": "Rate how important a consideration is in the scenario",
+    "empathy": "Pick the most empathetic / least empathetic response",
+    "escalation": "Rank options from best to worst response in the situation",
+    "role-identification": "Identify which actions fall within a stated professional role",
 }
 
 # ─── Section-Specific Generation Parameters ──────────────────────────────────

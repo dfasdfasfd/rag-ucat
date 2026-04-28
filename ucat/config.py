@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -38,6 +39,17 @@ TELEMETRY_FILE = os.environ.get("UCAT_TELEMETRY_FILE", "ucat_telemetry.jsonl")
 DEFAULT_LLM    = "claude-opus-4-7"
 DEFAULT_VERIFY_LLM = "claude-haiku-4-5"     # cheap second-opinion judge
 DEFAULT_JUDGE2_LLM = "claude-sonnet-4-6"    # tie-breaker in 3-judge mode
+
+# Per-section primary judge override. SJT scoring is rubric-based and
+# subjective; Haiku tends to vote `correct: true` indiscriminately under
+# the lenient prompt and the per-question difficulty estimates are noisy.
+# A Sonnet primary catches more rubric-violation false positives at ~5×
+# the per-call cost, which is acceptable for SJT's lower call volume.
+# Other sections stay on the cheap Haiku default — they have objective
+# answers Haiku can verify reliably.
+PRIMARY_JUDGE_BY_SECTION: Dict[str, str] = {
+    "SJT": "claude-sonnet-4-6",
+}
 DEFAULT_EMBED  = "voyage-3-large"
 
 LLM_CHOICES   = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
@@ -72,21 +84,24 @@ SECTIONS = {
     "DM": "Decision Making",
     "QR": "Quantitative Reasoning",
     "AR": "Abstract Reasoning",
+    "SJT": "Situational Judgement",
 }
 SECTION_COLORS = {
     "VR": "#4A90D9", "DM": "#E8943A",
     "QR": "#3FB950", "AR": "#A78BFA",
+    "SJT": "#F778BA",
 }
 SECTION_DESC = {
     "VR": "A passage (200-300 words) followed by exactly 4 questions. Each question is either True/False/Can't Tell OR 4-option multiple choice (A-D). Questions answerable ONLY from the passage.",
     "DM": "Exactly 5 standalone questions. Each is one of: syllogism, logical (clue-based), venn (set relationships), probability, or argument (strongest argument for/against). Each has 5 options (A-E). Venn questions MUST include a structured set spec (sets[]) for visual rendering.",
-    "QR": "One data stimulus (table, bar chart, or line chart) followed by exactly 4 calculation questions. Each has 5 numerical options (A-E). Step-by-step working in each explanation. Stimulus MUST be provided as a structured chart spec for visual rendering.",
+    "QR": "One data stimulus (table, bar chart, line chart, stacked-bar chart, or pie chart) followed by exactly 4 calculation questions. Each has 5 numerical options (A-E). Step-by-step working in each explanation. Stimulus MUST be provided as a structured chart spec for visual rendering.",
     "AR": "Type 1 set. Set A (6 panels with shape sets, hidden rule). Set B (6 panels with shape sets, different rule). Then 5 test shapes answered Set A / Set B / Neither. Panels MUST be provided as structured shape specs for visual rendering.",
+    "SJT": "A workplace/clinical scenario followed by exactly 4 questions. Each question asks about the appropriateness or importance of a candidate action/consideration. Options are typically a Likert scale (e.g. 'Very appropriate' / 'Appropriate but not ideal' / 'Inappropriate but not awful' / 'Very inappropriate', or 'Very important' / 'Important' / 'Of minor importance' / 'Not important at all'). No single 'correct' answer — judged against UCAT marking guidance.",
 }
 
 # Question count per generated set, mirroring the min/max in the Pydantic
 # section models. Used by bulk generation to convert "N questions" → "M sets".
-SET_SIZES = {"VR": 4, "DM": 5, "QR": 4, "AR": 5}
+SET_SIZES = {"VR": 4, "DM": 5, "QR": 4, "AR": 5, "SJT": 4}
 
 # Per-section subtype catalogue. Each entry is (storage_value, human_label).
 # storage_value matches the field used by the schema:
@@ -117,6 +132,10 @@ SUBTYPES_BY_SECTION = {
         ("pie",          "Pie"),
     ],
     "AR": [],
+    "SJT": [
+        ("appropriateness", "Appropriateness"),
+        ("importance",      "Importance"),
+    ],
 }
 
 
@@ -155,7 +174,20 @@ def difficulty_label(logits: float) -> str:
 # ─── Settings (persisted JSON) ────────────────────────────────────────────────
 
 class Settings:
-    """User preferences that survive across runs."""
+    """User preferences that survive across runs.
+
+    Thread-safe: a single ``threading.RLock`` serialises ``get`` / ``set`` /
+    ``load`` / ``save`` so concurrent reads from background workers (e.g. the
+    async verify thread) and writes from the UI thread can't tear the
+    underlying dict mid-update or interleave with disk persistence.
+
+    The lock is reentrant because ``set`` calls ``save`` while still holding
+    the lock — that's the only safe way to keep on-disk state and in-memory
+    state consistent across concurrent writers. The disk write happens under
+    the lock; readers in other threads briefly block on a contended save,
+    which is preferable to the alternative (two writers' snapshots racing
+    onto disk in the wrong order).
+    """
 
     DEFAULTS: Dict[str, Any] = {
         "llm":              DEFAULT_LLM,
@@ -171,36 +203,56 @@ class Settings:
         # ── Subtype targeting (added 2026-04-26) ───────────────────────────
         "bulk_subtype":            "",   # current dropdown value ("" == Any/mixed)
         "bulk_subtype_by_section": {     # remember per-section choice
-            "VR": "", "DM": "", "QR": "", "AR": "",
+            "VR": "", "DM": "", "QR": "", "AR": "", "SJT": "",
         },
         "bulk_quantity_unit":      "sets",  # "sets" or "questions" (derived from subtype)
     }
 
     def __init__(self, path: str = SETTINGS_FILE):
         self.path = path
+        self._lock = threading.RLock()
         self.data: Dict[str, Any] = dict(self.DEFAULTS)
         self.load()
 
     def load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, encoding="utf-8") as f:
-                    saved = json.load(f)
-                for k in self.DEFAULTS:
-                    if k in saved:
-                        self.data[k] = saved[k]
-            except Exception:
-                pass
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path, encoding="utf-8") as f:
+                        saved = json.load(f)
+                    for k in self.DEFAULTS:
+                        if k in saved:
+                            self.data[k] = saved[k]
+                except Exception:
+                    pass
 
     def save(self):
+        # Snapshot under the lock so we don't serialise a half-mutated dict,
+        # then release before the disk write so other readers aren't blocked
+        # on I/O.
+        with self._lock:
+            snapshot = dict(self.data)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2)
+                json.dump(snapshot, f, indent=2)
         except Exception:
             pass
 
-    def get(self, k: str) -> Any:    return self.data.get(k, self.DEFAULTS.get(k))
-    def set(self, k: str, v: Any):   self.data[k] = v; self.save()
+    def get(self, k: str) -> Any:
+        with self._lock:
+            return self.data.get(k, self.DEFAULTS.get(k))
+
+    def set(self, k: str, v: Any):
+        # Hold the lock across both the mutation AND the save() call. RLock
+        # makes this safe — save() re-enters and snapshots the same dict
+        # we just mutated. Without this, two concurrent set() calls can
+        # race: A mutates, releases, then B mutates+saves before A's save
+        # runs, so the on-disk state ends up reflecting A's value (older
+        # snapshot) while in-memory has B's. The lock keeps disk and
+        # memory consistent.
+        with self._lock:
+            self.data[k] = v
+            self.save()
 
 
 # ─── API key check ────────────────────────────────────────────────────────────

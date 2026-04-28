@@ -967,7 +967,6 @@ class App(tk.Tk):
                         on_delta=None,
                         on_verify_complete=lambda upd, idx=i: self.after(
                             0, lambda u=upd, _i=idx: self._bulk_verify_complete(_i, u)),
-                        variation_seed=str(uuid.uuid4())[:8],
                         force_scenario=diversify.get("scenario"),
                         avoid_topics=diversify.get("avoid_topics"),
                     )
@@ -1130,13 +1129,18 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _do_gen(self):
-        self._launch_gen(variation_seed=None)
+        self._launch_gen()
 
     def _do_regen(self):
-        seed = datetime.now().strftime("%H%M%S-%f")
-        self._launch_gen(variation_seed=seed)
+        # Regenerate is a fresh call. The retrieved KB pool will rotate
+        # naturally (cosine + MMR is deterministic but the embedding cache
+        # may have changed), and the difficulty target / coverage steers
+        # provide the actual entropy. The old `variation_seed` kwarg was
+        # theatre — Claude can't use an opaque hex string as sampling
+        # entropy with structured outputs enabled.
+        self._launch_gen()
 
-    def _launch_gen(self, variation_seed: Optional[str]):
+    def _launch_gen(self):
         if self._bulk_thread is not None and self._bulk_thread.is_alive():
             self._status("A bulk run is in progress — wait or stop it first.")
             return
@@ -1172,6 +1176,15 @@ class App(tk.Tk):
             self._stream_buf.append(text)
             self.after(0, lambda: self._set_streaming("".join(self._stream_buf)))
 
+        # Coverage-driven diversity steering for single-generation mode.
+        # Bulk runs got this from day one; single-gen used to be "manual
+        # control mode" where the user supplied the variety via hints,
+        # but the coverage tracker is now mature enough that auto-steer
+        # adds value without surprising the user (the steer goes into
+        # the user-turn, not the role block — visible in the trace).
+        stats = self.db.coverage_stats(section, last_n=200)
+        diversify = pick_diversification(stats, section) or {}
+
         def worker():
             try:
                 result = self.rag.generate(
@@ -1180,7 +1193,8 @@ class App(tk.Tk):
                     on_delta=on_delta,
                     on_verify_complete=lambda upd: self.after(
                         0, lambda u=upd: self._on_verify_complete(u)),
-                    variation_seed=variation_seed,
+                    force_scenario=diversify.get("scenario"),
+                    avoid_topics=diversify.get("avoid_topics"),
                 )
                 self.after(0, lambda: self._gen_ok(result, section))
             except Exception as e:
@@ -1421,8 +1435,19 @@ class App(tk.Tk):
         )
         if not p: return
         try:
-            n = self.db.import_json(p)
-            messagebox.showinfo("Import", f"Imported {n} document(s).\nNow click '⊛ Index Knowledge Base'.")
+            result = self.db.import_json(p)
+            parts = [f"Imported {result['added']} new document(s)."]
+            if result["skipped"] > 0:
+                parts.append(
+                    f"Skipped {result['skipped']} duplicate(s) already in the KB."
+                )
+            if result["ignored"] > 0:
+                parts.append(
+                    f"Ignored {result['ignored']} malformed entry(ies)."
+                )
+            if result["added"] > 0:
+                parts.append("\nNow click '⊛ Index Knowledge Base'.")
+            messagebox.showinfo("Import", "\n".join(parts))
             self._refresh_stats(); self._refresh_kb()
         except Exception as e:
             messagebox.showerror("Import Error", str(e))
@@ -1575,10 +1600,19 @@ class App(tk.Tk):
 
     def _promote(self):
         if self._sel_gen_id:
-            self.db.promote_to_kb(self._sel_gen_id)
+            # Pass embed_doc so the new KB row gets its embedding computed
+            # in the same call. Without this, the row sits in the KB with
+            # embedding=NULL and doesn't participate in retrieval until the
+            # user manually clicks ⊛ Index Knowledge Base.
+            from .llm import embed_doc
+            self.db.promote_to_kb(
+                self._sel_gen_id,
+                embed_fn=embed_doc,
+                embed_model=self.settings.get("embed"),
+            )
             self._refresh_stats(); self._refresh_kb()
             self._promobtn.config(state="disabled")
-            self._status("Added to knowledge base — re-index to activate for RAG")
+            self._status("Added to knowledge base and indexed.")
 
     def _refresh_stats(self):
         for code in SECTIONS:
