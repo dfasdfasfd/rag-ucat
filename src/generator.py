@@ -97,12 +97,18 @@ class GenerationPipeline:
                 on_progress("Parsing output...")
             try:
                 data = json.loads(raw)
-            except json.JSONDecodeError:
-                last_errors.append("Output is not valid JSON despite format:json")
+            except json.JSONDecodeError as e:
+                # Truncation: bump num_predict for next attempt to give the model headroom.
+                if "Unterminated" in str(e) or "Expecting" in str(e):
+                    gen_options["num_predict"] = min(
+                        int(gen_options.get("num_predict", 4096) * 1.5),
+                        8192,
+                    )
+                last_errors.append(f"Output is not valid JSON: {e}")
                 if attempt < max_retries - 1:
                     system, user = self.prompts.build_retry(
                         system, user, raw[:2000],
-                        ["Output was not valid JSON. Return ONLY a JSON object."]
+                        [f"Output was not valid JSON ({e}). Return ONLY a JSON object."]
                     )
                 continue
 
