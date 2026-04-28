@@ -404,20 +404,38 @@ class App(tk.Tk):
                  bg=BG, fg=MUTED, font=FS, wraplength=1100, justify="left"
                  ).pack(anchor="w", pady=(2, 14))
 
-        # Section radios.
+        # Equate mode checkbox — inserted above the Section radios so it
+        # visually frames the entire single/equate decision.
+        er = tk.Frame(p, bg=BG); er.pack(anchor="w", pady=(0, 6))
+        self._bulk_equate = tk.BooleanVar(value=bool(self.settings.get("bulk_equate")))
+        tk.Checkbutton(
+            er,
+            text=" Equate across VR/QR/SJT/DM (same qty for each section)",
+            variable=self._bulk_equate, bg=BG, fg=TEXT, selectcolor=PANEL,
+            activebackground=BG, activeforeground=ACCENT, font=FM,
+            command=self._bulk_equate_changed,
+        ).pack(side="left")
+
+        # Section radios. Stored so _bulk_equate_changed can toggle their state.
         sr = tk.Frame(p, bg=BG); sr.pack(anchor="w", pady=(0, 10))
         tk.Label(sr, text="Section:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
         self._bulk_sec = tk.StringVar(value=self.settings.get("bulk_section"))
+        self._bulk_section_radios: list[tk.Radiobutton] = []
         for code in SECTIONS:
-            tk.Radiobutton(sr, text=f" {code} ", variable=self._bulk_sec, value=code,
+            rb = tk.Radiobutton(sr, text=f" {code} ", variable=self._bulk_sec, value=code,
                            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
                            activeforeground=ACCENT, font=FB, indicatoron=False,
                            relief="flat", bd=1, padx=12, pady=6, cursor="hand2",
                            command=self._bulk_section_changed
-                           ).pack(side="left", padx=4)
+                           )
+            rb.pack(side="left", padx=4)
+            self._bulk_section_radios.append(rb)
 
         # Subtype dropdown — populated based on the selected section.
-        sb = tk.Frame(p, bg=BG); sb.pack(anchor="w", pady=(0, 10))
+        # Stored on self so equate mode can hide/show the whole row.
+        self._bulk_subtype_frame = tk.Frame(p, bg=BG)
+        self._bulk_subtype_frame.pack(anchor="w", pady=(0, 10))
+        sb = self._bulk_subtype_frame
         tk.Label(sb, text="Subtype:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
         self._bulk_subtype = tk.StringVar(value="")
         self._bulk_subtype_cb = ttk.Combobox(
@@ -496,7 +514,40 @@ class App(tk.Tk):
         self._bulk_preview.pack(fill="both", expand=True)
         self._bulk_preview.config(state="disabled")
 
+        # If the user previously left equate ticked, apply the disabled/hidden
+        # state now (the BooleanVar's initial value is set above; this call
+        # propagates it through to the radios and subtype frame).
+        if self._bulk_equate.get():
+            self._bulk_equate_changed()
+
         # Initialise the cost banner.
+        self._bulk_inputs_changed()
+
+    def _bulk_equate_changed(self):
+        """Called when the equate checkbox is toggled. Disables the Section
+        radios + hides the Subtype row when on; restores them when off.
+        Persists the setting and triggers a cost-banner refresh."""
+        equate = self._bulk_equate.get()
+        self.settings.set("bulk_equate", equate)
+
+        # Section radios.
+        radio_state = "disabled" if equate else "normal"
+        for rb in self._bulk_section_radios:
+            rb.config(state=radio_state)
+
+        # Subtype row — entirely hidden when equate is on.
+        if equate:
+            self._bulk_subtype_frame.pack_forget()
+        else:
+            # Repack at its original position (between section radios and
+            # quantity row). pack() without `before=` re-appends to the end,
+            # which is fine here because nothing has been packed since.
+            # If the layout changes in future, switch to `before=<next-frame>`.
+            self._bulk_subtype_frame.pack(anchor="w", pady=(0, 10))
+            # When restoring, also force the choices to refresh in case the
+            # current section's catalogue has changed.
+            self._bulk_refresh_subtype_choices()
+
         self._bulk_inputs_changed()
 
     def _bulk_section_changed(self):
