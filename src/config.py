@@ -248,7 +248,7 @@ SECTION_GEN_PARAMS = {
     "VR": {
         "temperature": 0.78,
         "top_p": 0.90,
-        "num_predict": 3200,
+        "num_predict": 4096,
         "preferred_llm": "qwen2.5:14b",
     },
     "DM": {
