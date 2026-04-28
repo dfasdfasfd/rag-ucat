@@ -62,6 +62,64 @@ def test_equate_task_list_balanced_counts():
                 f"n={n}, section {s}: expected {n}, got {result.count(s)}"
 
 
+# ─── estimate_section_cost ───────────────────────────────────────────────────
+
+from ucat.config import (
+    SECTION_COST_MULTIPLIERS,
+    estimate_section_cost,
+    estimate_bulk_cost,
+)
+
+
+def test_section_multipliers_normalised_across_equate():
+    """Sum of multipliers across EQUATE_SECTIONS must equal 4.0 so total cost
+    is unchanged from a flat 4× estimate (just split, not inflated)."""
+    total = sum(SECTION_COST_MULTIPLIERS[s] for s in EQUATE_SECTIONS)
+    assert abs(total - 4.0) < 1e-9, \
+        f"EQUATE_SECTIONS multipliers sum to {total}, expected 4.0"
+
+
+def test_section_multipliers_all_positive():
+    for s, m in SECTION_COST_MULTIPLIERS.items():
+        assert m > 0, f"section {s} has non-positive multiplier {m}"
+
+
+def test_estimate_section_cost_applies_multiplier():
+    """Per-section cost is base × multiplier."""
+    base_low, base_high = estimate_bulk_cost(
+        10, "claude-sonnet-4-6", multi_judge=False, verify=False)
+    sec_low, sec_high = estimate_section_cost(
+        "VR", 10, "claude-sonnet-4-6", multi_judge=False, verify=False)
+    expected_mult = SECTION_COST_MULTIPLIERS["VR"]
+    assert abs(sec_low  - base_low  * expected_mult) < 1e-9
+    assert abs(sec_high - base_high * expected_mult) < 1e-9
+
+
+def test_estimate_section_cost_sums_to_4x_baseline_across_equate():
+    """For the same n_sets and model, sum of per-section figures across
+    EQUATE_SECTIONS equals 4× the baseline estimate (within rounding)."""
+    base_low, base_high = estimate_bulk_cost(
+        25, "claude-sonnet-4-6", multi_judge=False, verify=True)
+    total_low, total_high = 0.0, 0.0
+    for s in EQUATE_SECTIONS:
+        l, h = estimate_section_cost(
+            s, 25, "claude-sonnet-4-6", multi_judge=False, verify=True)
+        total_low  += l
+        total_high += h
+    assert abs(total_low  - 4 * base_low)  < 1e-9
+    assert abs(total_high - 4 * base_high) < 1e-9
+
+
+def test_estimate_section_cost_unknown_section_uses_1():
+    """Sections outside the multiplier table fall back to multiplier 1.0."""
+    base_low, base_high = estimate_bulk_cost(
+        5, "claude-sonnet-4-6", multi_judge=False, verify=False)
+    sec_low, sec_high = estimate_section_cost(
+        "UNKNOWN", 5, "claude-sonnet-4-6", multi_judge=False, verify=False)
+    assert abs(sec_low  - base_low)  < 1e-9
+    assert abs(sec_high - base_high) < 1e-9
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):
