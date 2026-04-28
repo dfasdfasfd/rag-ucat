@@ -80,36 +80,6 @@ class Question(BaseModel):
                               description="IRT logits on the 1.0-5.0 scale.")
     coverage: CoverageTags
 
-    # Path-C generic enrichment fields (audit-3 M1 + M2). Replace Claude's
-    # noisy 1.0-5.0 difficulty guess by giving the calibrator less-noisy
-    # raw inputs (`solve_steps` + `distractor_proximity`); downstream IRT
-    # and judge-blending stay backward-compatible while the new fields
-    # arrive. `common_mistake` carries error-pattern hints lifted from
-    # the explanation panel — feeds distractor generation.
-    solve_steps: Optional[int] = Field(
-        default=None, ge=0, le=20,
-        description=(
-            "Coarse complexity proxy. QR: arithmetic-op count. DM: inference-hop count. "
-            "VR: distinct passage references the candidate must reconcile. SJT: usually 1-2."
-        ),
-    )
-    distractor_proximity: Optional[DistractorProximity] = Field(
-        default=None,
-        description=(
-            "How close the wrong answers cluster to the right one. "
-            "'near' = within ~10% numerically or differs by one logical clause. "
-            "'far' = obviously wrong by inspection. 'moderate' = anything between."
-        ),
-    )
-    common_mistake: Optional[str] = Field(
-        default=None,
-        description=(
-            "Typical error pattern lifted from the explanation panel "
-            "(e.g. 'candidates often divide instead of multiplying'). "
-            "Pure gold for distractor generation downstream."
-        ),
-    )
-
     @field_validator("options", mode="before")
     @classmethod
     def _accept_legacy_dict(cls, v: Any) -> Any:
@@ -161,11 +131,7 @@ class ARSet(BaseModel):
 
 # QR — quantitative reasoning data stimulus.
 
-# `matrix` added in Path-C (audit-3 H3) to support transition tables /
-# cross-tabs (voter transitions, contingency tables) where both axes
-# carry meaningful categories — collapsing them into categories+series
-# loses dual-axis semantics.
-QRChartType = Literal["table", "bar", "line", "stacked_bar", "pie", "matrix"]
+QRChartType = Literal["table", "bar", "line", "stacked_bar", "pie"]
 
 
 class QRSeries(BaseModel):
@@ -190,30 +156,6 @@ class QRTableColumn(BaseModel):
     )
 
 
-class QRMatrix(BaseModel):
-    """A 2-D cross-tabulation with meaningful row AND column axes.
-
-    Used for transition tables (e.g. voter transitions April→September),
-    contingency tables, dose × outcome cross-tabs. The 1-D `categories +
-    series + rows` representation flattens dual-axis semantics; this
-    struct preserves them so the verifier and renderer can reason about
-    "row R, column C" cells directly.
-    """
-    model_config = ConfigDict(extra="forbid")
-    row_axis_label: str
-    col_axis_label: str
-    row_categories: List[str] = Field(min_length=2)
-    col_categories: List[str] = Field(min_length=2)
-    cells: List[List[str]] = Field(
-        description=(
-            "2-D array indexed [row_i][col_j]. Cell values as strings — "
-            "numerics should be stringified (e.g. '12.5')."
-        ),
-    )
-    row_totals: Optional[List[str]] = None
-    col_totals: Optional[List[str]] = None
-
-
 class QRChart(BaseModel):
     type: QRChartType
     title: str
@@ -230,19 +172,8 @@ class QRChart(BaseModel):
             "List of {name, values} columns; values length must match categories length."
         ),
     )
-    matrix: Optional[QRMatrix] = Field(
-        default=None,
-        description=(
-            "Cross-tabulation form ONLY (matrix-typed charts). "
-            "Use when the figure is a 2-D grid with meaningful labels on both axes."
-        ),
-    )
     units: Optional[str] = None  # e.g. "£000s", "%"
     note: Optional[str] = None   # optional caption
-    # Path-C: source attribution / asterisk-marked footnotes lifted from
-    # the chart caption area. Often-overlooked context — e.g.
-    # "*excludes weekends", "Source: ONS 2022".
-    footnotes: List[str] = Field(default_factory=list)
 
     @field_validator("rows", mode="before")
     @classmethod
@@ -264,28 +195,9 @@ class QRChart(BaseModel):
         return {col.name: list(col.values) for col in rows}
 
 
-# QR-specific skill taxonomy (audit-3 H1) — primary axis for retrieval
-# diversification. Free-text `coverage.topic` stays as secondary annotation.
-QRSkillTag = Literal[
-    "ratio-percent",
-    "mean-aggregate",
-    "drug-dosage",
-    "unit-conversion",
-    "geometry-area",
-    "prob-frequency",
-    "compound-growth",
-    "data-readout",
-    "speed-distance-time",
-    "scaling-extrapolation",
-    "other",
-]
-
-
 class QRQuestion(Question):
-    """QR extends Question with a closed skill_tag enum so retrieval can
-    diversify on a stable axis (free-text `topic` cardinality explodes
-    and rarely matches). Optional for back-compat with pre-Path-C rows."""
-    skill_tag: Optional[QRSkillTag] = None
+    """QR question — currently identical to base Question."""
+    pass
 
 
 class QRSet(BaseModel):
