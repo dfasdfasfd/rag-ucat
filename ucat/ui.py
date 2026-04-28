@@ -24,7 +24,8 @@ from .coverage import pick_diversification
 from .config import (APP_TITLE, LLM_CHOICES, EMBED_CHOICES, SECTIONS, SECTION_COLORS,
                       DEFAULT_LLM, DEFAULT_EMBED, IRT_BANDS, api_status, Settings,
                       BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost,
-                      SUBTYPES_BY_SECTION, SET_SIZES, compute_set_count)
+                      SUBTYPES_BY_SECTION, SET_SIZES, compute_set_count,
+                      EQUATE_SECTIONS, equate_task_list, estimate_section_cost)
 from .db import Database
 from .format import format_qset
 from .rag import RAGEngine
@@ -591,6 +592,7 @@ class App(tk.Tk):
         settings, and gates the Start button."""
         section = self._bulk_sec.get()
         hint    = self._bulk_hint.get()
+        equate  = self._bulk_equate.get()
 
         # Resolve subtype: combobox stores the human label; we map back to the
         # internal storage value (e.g. 'venn'). 'Any (mixed)' → "" → None.
@@ -611,8 +613,10 @@ class App(tk.Tk):
         self.settings.set("bulk_quantity_unit",
                             "questions" if subtype else "sets")
 
-        # Flip the Quantity label.
-        self._bulk_qty_lbl.config(text=("Questions:" if subtype else "Sets:"))
+        # Flip the Quantity label. In equate mode the label is always "Sets:"
+        # since equate forces subtype to None even if a value is persisted.
+        self._bulk_qty_lbl.config(
+            text=("Sets:" if equate or not subtype else "Questions:"))
 
         # Parse quantity.
         raw = self._bulk_qty.get().strip()
@@ -625,8 +629,11 @@ class App(tk.Tk):
         # Bail if quantity is invalid.
         if n_input is None or n_input < 1:
             self._bulk_yield_lbl.config(text="")
-            max_input = (BULK_MAX_QUANTITY * SET_SIZES.get(section, 5)) if subtype \
-                          else BULK_MAX_QUANTITY
+            if equate:
+                max_input = BULK_MAX_QUANTITY  # per-section cap
+            else:
+                max_input = (BULK_MAX_QUANTITY * SET_SIZES.get(section, 5)) if subtype \
+                              else BULK_MAX_QUANTITY
             self._bulk_cost_lbl.config(
                 text=f"Enter a number 1 - {max_input}.",
                 fg=WARN,
@@ -635,14 +642,21 @@ class App(tk.Tk):
             return
 
         # Compute set count and yield helper line.
-        n_sets = compute_set_count(n_input, section, subtype)
         capped = False
-        if n_sets > BULK_MAX_QUANTITY:
-            n_sets = BULK_MAX_QUANTITY
-            capped = True
+        if equate:
+            # Input is per-section count; total n_sets = per_section × 4.
+            per_section = min(n_input, BULK_MAX_QUANTITY)
+            if per_section < n_input:
+                capped = True
+            n_sets = per_section * len(EQUATE_SECTIONS)
+        else:
+            n_sets = compute_set_count(n_input, section, subtype)
+            if n_sets > BULK_MAX_QUANTITY:
+                n_sets = BULK_MAX_QUANTITY
+                capped = True
 
-        # Helper line — only when subtype is set.
-        if subtype:
+        # Helper line — only when subtype is set and equate is off.
+        if subtype and not equate:
             per_set = SET_SIZES[section]
             yielded = n_sets * per_set
             extra = yielded - n_input
@@ -661,10 +675,18 @@ class App(tk.Tk):
         jury    = bool(self.settings.get("multi_judge"))
         low, high = estimate_bulk_cost(n_sets, llm, multi_judge=jury, verify=verify)
 
-        suffix = "  (capped at the max — split into multiple runs for more)" if capped else ""
+        if equate:
+            cap_suffix = ("  (capped at 100 per section — split into multiple "
+                          "runs for more)") if capped else ""
+            descriptor = (f"{n_sets // len(EQUATE_SECTIONS)} sets × "
+                          f"{len(EQUATE_SECTIONS)} sections × {llm}{cap_suffix}")
+        else:
+            cap_suffix = "  (capped at the max — split into multiple runs for more)" \
+                if capped else ""
+            descriptor = f"{n_sets} sets × {llm}{cap_suffix}"
+
         self._bulk_cost_lbl.config(
-            text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   "
-                 f"({n_sets} sets × {llm}{suffix})",
+            text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   ({descriptor})",
             fg=ACCENT,
         )
 
@@ -702,17 +724,39 @@ class App(tk.Tk):
         if n_input < 1:
             return
 
-        # Convert questions → sets when subtype is set; cap at the max set count.
-        n = compute_set_count(n_input, section, subtype)
-        n = min(n, BULK_MAX_QUANTITY)
-        if n < 1:
-            return
+        equate = self._bulk_equate.get()
 
-        if self.db.count(section, indexed_only=True) == 0:
-            if not messagebox.askyesno("No Indexed Documents",
-                f"No indexed documents for {SECTIONS[section]}.\n\n"
-                "Add docs and click Index, or generate without RAG context?"):
+        if equate:
+            # Equate: input is sets-per-section, cap is per-section.
+            subtype = None
+            n_per_section = min(n_input, BULK_MAX_QUANTITY)
+            if n_per_section < 1:
                 return
+            n = n_per_section * len(EQUATE_SECTIONS)  # used for cost preview math
+            task_list = equate_task_list(n_per_section)
+
+            # Batched no-RAG dialog: collect every empty section and ask once.
+            empty = [s for s in EQUATE_SECTIONS
+                     if self.db.count(s, indexed_only=True) == 0]
+            if empty:
+                if not messagebox.askyesno(
+                    "No Indexed Documents",
+                    f"No indexed documents for: {', '.join(empty)}.\n\n"
+                    "Add docs and click Index, or generate without RAG context?"):
+                    return
+        else:
+            # Single-section: existing logic (questions → sets when subtype set).
+            n = compute_set_count(n_input, section, subtype)
+            n = min(n, BULK_MAX_QUANTITY)
+            if n < 1:
+                return
+            task_list = [section] * n
+
+            if self.db.count(section, indexed_only=True) == 0:
+                if not messagebox.askyesno("No Indexed Documents",
+                    f"No indexed documents for {SECTIONS[section]}.\n\n"
+                    "Add docs and click Index, or generate without RAG context?"):
+                    return
 
         hint = self._bulk_hint.get()
 
@@ -722,23 +766,26 @@ class App(tk.Tk):
         jury   = bool(self.settings.get("multi_judge"))
         low, high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
 
-        if high > BULK_COST_CONFIRM_THRESHOLD:
+        threshold = float(self.settings.get("bulk_cost_confirm_threshold")
+                            or BULK_COST_CONFIRM_THRESHOLD)
+        if high > threshold:
+            if equate:
+                section_line = (f"Sections: {', '.join(EQUATE_SECTIONS)} "
+                                f"({n // len(EQUATE_SECTIONS)} sets each)")
+            else:
+                section_line = f"Section: {SECTIONS[section]}"
             ok = messagebox.askyesno(
                 "Confirm bulk run",
                 f"Estimated cost: ${low:.2f} - ${high:.2f}\n"
                 f"Sets: {n}\n"
-                f"Section: {SECTIONS[section]}\n"
+                f"{section_line}\n"
                 f"Model: {llm}\n\n"
                 f"Continue?",
             )
             if not ok:
                 return
 
-        # Build the task list. Single-section mode = [section] * n; equate
-        # mode (added in a later task) will branch here to call
-        # equate_task_list(n) instead.
-        task_list = [section] * n
-
+        # task_list was built above (either equate or single-section path).
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
             target=self._bulk_worker, args=(task_list, hint, subtype), daemon=True
