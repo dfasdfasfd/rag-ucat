@@ -476,7 +476,13 @@ class App(tk.Tk):
         self._bulk_cost_lbl = tk.Label(
             p, text="", bg=BG, fg=ACCENT, font=FB, anchor="w"
         )
-        self._bulk_cost_lbl.pack(anchor="w", pady=(2, 12))
+        self._bulk_cost_lbl.pack(anchor="w", pady=(2, 0))
+
+        # Per-section breakdown (equate mode only — empty otherwise).
+        self._bulk_breakdown_lbl = tk.Label(
+            p, text="", bg=BG, fg=MUTED, font=FS, anchor="w"
+        )
+        self._bulk_breakdown_lbl.pack(anchor="w", pady=(0, 12))
 
         # Action row.
         ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
@@ -638,6 +644,7 @@ class App(tk.Tk):
                 text=f"Enter a number 1 - {max_input}.",
                 fg=WARN,
             )
+            self._bulk_breakdown_lbl.config(text="")
             self._bulk_start_btn.config(state="disabled")
             return
 
@@ -689,6 +696,20 @@ class App(tk.Tk):
             text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   ({descriptor})",
             fg=ACCENT,
         )
+
+        # Per-section breakdown (equate mode only).
+        if equate and not capped:
+            per_section = n_sets // len(EQUATE_SECTIONS)
+            parts = []
+            for s in EQUATE_SECTIONS:
+                _l, h = estimate_section_cost(
+                    s, per_section, llm, multi_judge=jury, verify=verify)
+                parts.append(f"{s} ~${h:.2f}")
+            self._bulk_breakdown_lbl.config(
+                text="↳ " + "  ·  ".join(parts),
+            )
+        else:
+            self._bulk_breakdown_lbl.config(text="")
 
         # Don't override "running" state — we re-enable in _bulk_run_finished.
         if self._bulk_thread is None or not self._bulk_thread.is_alive():
