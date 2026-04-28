@@ -1061,13 +1061,18 @@ class App(tk.Tk):
         self._bulk_started_at = None
         self._bulk_start_btn.config(state="normal", text="⚡  START BULK RUN")
         self._bulk_stop_btn.config(state="disabled")
+        actual = self._bulk_run_cost
+        est    = self._bulk_last_estimate_high or 0.0
+        cost_tail = f"  Actual: ${actual:.2f} (est ${est:.2f})"
         if stopped:
-            tail = f"Stopped at {succeeded + failed} / {n}."
+            done_count = succeeded + failed
+            tail = f"Stopped at {done_count} / {n} sets.{cost_tail}"
         else:
             drift_note = f" ({drift_count} with subtype drift)" if drift_count else ""
             tail = f"Bulk run finished: {succeeded} succeeded{drift_note}, {failed} failed"
             if skipped: tail += f", {skipped} skipped"
             tail += "."
+            tail += cost_tail
         self._bulk_progress_lbl.config(text=tail)
         self._status(tail)
         self._bulk_inputs_changed()  # re-evaluate Start button against new state
