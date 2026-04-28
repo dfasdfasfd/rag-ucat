@@ -120,6 +120,52 @@ def test_estimate_section_cost_unknown_section_uses_1():
     assert abs(sec_high - base_high) < 1e-9
 
 
+# ─── Settings defaults ───────────────────────────────────────────────────────
+
+from ucat.config import Settings
+
+
+def test_settings_default_bulk_equate_is_false():
+    s = Settings(path=tempfile.mktemp(suffix=".json"))
+    assert s.get("bulk_equate") is False, \
+        f"expected default False, got {s.get('bulk_equate')!r}"
+
+
+def test_settings_default_bulk_cost_confirm_threshold_is_5():
+    s = Settings(path=tempfile.mktemp(suffix=".json"))
+    threshold = s.get("bulk_cost_confirm_threshold")
+    assert threshold == 5.00, \
+        f"expected default 5.00, got {threshold!r}"
+
+
+def test_settings_persists_bulk_equate():
+    path = tempfile.mktemp(suffix=".json")
+    s1 = Settings(path=path)
+    s1.set("bulk_equate", True)
+    s2 = Settings(path=path)
+    assert s2.get("bulk_equate") is True
+
+
+def test_settings_persists_bulk_cost_confirm_threshold():
+    path = tempfile.mktemp(suffix=".json")
+    s1 = Settings(path=path)
+    s1.set("bulk_cost_confirm_threshold", 12.50)
+    s2 = Settings(path=path)
+    assert s2.get("bulk_cost_confirm_threshold") == 12.50
+
+
+def test_settings_missing_keys_fall_back_to_defaults():
+    """A settings file from before this change should load cleanly with the
+    new keys taking their defaults."""
+    import json
+    path = tempfile.mktemp(suffix=".json")
+    with open(path, "w") as f:
+        json.dump({"llm": "claude-sonnet-4-6"}, f)  # no bulk_equate, no threshold
+    s = Settings(path=path)
+    assert s.get("bulk_equate") is False
+    assert s.get("bulk_cost_confirm_threshold") == 5.00
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in list(globals().items()):

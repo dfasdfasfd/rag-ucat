@@ -230,6 +230,9 @@ class Settings:
             "VR": "", "DM": "", "QR": "", "AR": "", "SJT": "",
         },
         "bulk_quantity_unit":      "sets",  # "sets" or "questions" (derived from subtype)
+        # ── Equate mode + configurable confirm threshold (added 2026-04-28) ─
+        "bulk_equate":                  False,   # tick to run VR/QR/SJT/DM together
+        "bulk_cost_confirm_threshold":  5.00,    # USD; overrides BULK_COST_CONFIRM_THRESHOLD
     }
 
     def __init__(self, path: str = SETTINGS_FILE):
