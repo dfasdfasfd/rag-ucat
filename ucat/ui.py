@@ -484,6 +484,23 @@ class App(tk.Tk):
         )
         self._bulk_breakdown_lbl.pack(anchor="w", pady=(0, 12))
 
+        # Configurable cost-confirm threshold. Set high (e.g. 999) to silence
+        # the dialog; set low (e.g. 0) to confirm every run.
+        tr = tk.Frame(p, bg=BG); tr.pack(anchor="w", pady=(0, 12))
+        tk.Label(tr, text="Confirm above: $", bg=BG, fg=MUTED, font=FS
+                 ).pack(side="left")
+        self._bulk_threshold_var = tk.StringVar(
+            value=f"{float(self.settings.get('bulk_cost_confirm_threshold') or BULK_COST_CONFIRM_THRESHOLD):.2f}"
+        )
+        threshold_entry = tk.Entry(
+            tr, textvariable=self._bulk_threshold_var,
+            bg=PANEL2, fg=TEXT, font=FS,
+            insertbackground=ACCENT, relief="flat", width=8,
+        )
+        threshold_entry.pack(side="left")
+        threshold_entry.bind("<FocusOut>", lambda _e: self._bulk_threshold_finalised())
+        threshold_entry.bind("<Return>",   lambda _e: self._bulk_threshold_finalised())
+
         # Action row.
         ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
         self._bulk_start_btn = mkbtn(
@@ -556,6 +573,23 @@ class App(tk.Tk):
             self._bulk_refresh_subtype_choices()
 
         self._bulk_inputs_changed()
+
+    def _bulk_threshold_finalised(self):
+        """Validate the cost-confirm threshold entry on focus-out / Return.
+        Reverts to the last good value on invalid input."""
+        raw = self._bulk_threshold_var.get().strip()
+        try:
+            value = float(raw)
+            if value < 0:
+                raise ValueError("threshold must be non-negative")
+        except ValueError:
+            # Revert: read the last good value back into the entry.
+            current = float(self.settings.get("bulk_cost_confirm_threshold")
+                              or BULK_COST_CONFIRM_THRESHOLD)
+            self._bulk_threshold_var.set(f"{current:.2f}")
+            return
+        self.settings.set("bulk_cost_confirm_threshold", value)
+        self._bulk_threshold_var.set(f"{value:.2f}")
 
     def _bulk_section_changed(self):
         """Called when the Section radio changes. Refreshes subtype choices
