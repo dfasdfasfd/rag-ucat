@@ -279,6 +279,7 @@ QRSkillTag = Literal[
     "data-readout",
     "speed-distance-time",
     "scaling-extrapolation",
+    "other",
 ]
 
 
@@ -323,6 +324,7 @@ DMSkillTag = Literal[
     "recognise-assumption",
     "logical-puzzle",
     "interpreting-information",
+    "other",
 ]
 
 
@@ -338,7 +340,6 @@ class DMQuestion(Question):
     # the typical 5-conclusion layout).
     conclusion_validity: Optional[List[Literal["yes", "no"]]] = Field(
         default=None,
-        min_length=2,
         max_length=8,
     )
 
@@ -363,6 +364,7 @@ VRMinigameKind = Literal[
     "inference",    # what can be concluded from the passage
     "vocabulary",   # word substitution / lexical knowledge (audit-3 M4)
     "application",  # transfer the argument to a new scenario (audit-3 M4)
+    "other",        # explicit fallback for unclassifiable items
 ]
 
 
@@ -415,6 +417,7 @@ SJTSkillTag = Literal[
     "patient-safety",
     "honesty-integrity",
     "resource-stewardship",
+    "other",
 ]
 
 
