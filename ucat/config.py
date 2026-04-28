@@ -156,6 +156,30 @@ def compute_set_count(n_input: int, section: str,
     per_set = SET_SIZES.get(section, 1) or 1
     return math.ceil(n_input / per_set)
 
+
+# ─── Bulk equate mode ────────────────────────────────────────────────────────
+
+# The four sections that participate in equate mode. AR is intentionally
+# excluded — it's pattern-matching, not directly comparable to the four
+# reasoning sections, and a balanced UCAT mock typically pairs the reasoning
+# sections together. Order is the round-robin order used by equate_task_list.
+EQUATE_SECTIONS: tuple[str, ...] = ("VR", "QR", "SJT", "DM")
+
+
+def equate_task_list(n: int) -> list[str]:
+    """Round-robin section list for an equate run.
+
+    n=0 → []
+    n=1 → ["VR", "QR", "SJT", "DM"]
+    n=3 → ["VR", "QR", "SJT", "DM", "VR", "QR", "SJT", "DM", "VR", "QR", "SJT", "DM"]
+
+    Returns an empty list for non-positive n.
+    """
+    if n <= 0:
+        return []
+    return list(EQUATE_SECTIONS) * n
+
+
 # IRT difficulty bands (Rasch logits). Predicted by Claude per question;
 # refined when student response data accumulates.
 IRT_BANDS = {
