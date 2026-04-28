@@ -24,7 +24,8 @@ from .coverage import pick_diversification
 from .config import (APP_TITLE, LLM_CHOICES, EMBED_CHOICES, SECTIONS, SECTION_COLORS,
                       DEFAULT_LLM, DEFAULT_EMBED, IRT_BANDS, api_status, Settings,
                       BULK_MAX_QUANTITY, BULK_COST_CONFIRM_THRESHOLD, estimate_bulk_cost,
-                      SUBTYPES_BY_SECTION, SET_SIZES, compute_set_count)
+                      SUBTYPES_BY_SECTION, SET_SIZES, compute_set_count,
+                      EQUATE_SECTIONS, equate_task_list, estimate_section_cost)
 from .db import Database
 from .format import format_qset
 from .rag import RAGEngine
@@ -126,6 +127,7 @@ class App(tk.Tk):
         self._bulk_rows: List[Dict[str, Any]] = []
         self._bulk_started_at: Optional[float] = None
         self._bulk_run_cost: float = 0.0  # accumulated USD for the active run
+        self._bulk_last_estimate_high: float = 0.0  # cost-banner upper bound at run start
 
         # Generation toggles shared between Generate and Bulk tabs. One
         # BooleanVar each so ticking the box on either tab updates the
@@ -451,20 +453,38 @@ class App(tk.Tk):
                  bg=BG, fg=MUTED, font=FS, wraplength=1100, justify="left"
                  ).pack(anchor="w", pady=(2, 14))
 
-        # Section radios.
+        # Equate mode checkbox — inserted above the Section radios so it
+        # visually frames the entire single/equate decision.
+        er = tk.Frame(p, bg=BG); er.pack(anchor="w", pady=(0, 6))
+        self._bulk_equate = tk.BooleanVar(value=bool(self.settings.get("bulk_equate")))
+        tk.Checkbutton(
+            er,
+            text=" Equate across VR/QR/SJT/DM (same qty for each section)",
+            variable=self._bulk_equate, bg=BG, fg=TEXT, selectcolor=PANEL,
+            activebackground=BG, activeforeground=ACCENT, font=FM,
+            command=self._bulk_equate_changed,
+        ).pack(side="left")
+
+        # Section radios. Stored so _bulk_equate_changed can toggle their state.
         sr = tk.Frame(p, bg=BG); sr.pack(anchor="w", pady=(0, 10))
         tk.Label(sr, text="Section:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
         self._bulk_sec = tk.StringVar(value=self.settings.get("bulk_section"))
+        self._bulk_section_radios: list[tk.Radiobutton] = []
         for code in SECTIONS:
-            tk.Radiobutton(sr, text=f" {code} ", variable=self._bulk_sec, value=code,
+            rb = tk.Radiobutton(sr, text=f" {code} ", variable=self._bulk_sec, value=code,
                            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
                            activeforeground=ACCENT, font=FB, indicatoron=False,
                            relief="flat", bd=1, padx=12, pady=6, cursor="hand2",
                            command=self._bulk_section_changed
-                           ).pack(side="left", padx=4)
+                           )
+            rb.pack(side="left", padx=4)
+            self._bulk_section_radios.append(rb)
 
         # Subtype dropdown — populated based on the selected section.
-        sb = tk.Frame(p, bg=BG); sb.pack(anchor="w", pady=(0, 10))
+        # Stored on self so equate mode can hide/show the whole row.
+        self._bulk_subtype_frame = tk.Frame(p, bg=BG)
+        self._bulk_subtype_frame.pack(anchor="w", pady=(0, 10))
+        sb = self._bulk_subtype_frame
         tk.Label(sb, text="Subtype:", bg=BG, fg=MUTED, font=FM).pack(side="left", padx=(0, 14))
         self._bulk_subtype = tk.StringVar(value="")
         self._bulk_subtype_cb = ttk.Combobox(
@@ -518,7 +538,37 @@ class App(tk.Tk):
         self._bulk_cost_lbl = tk.Label(
             p, text="", bg=BG, fg=ACCENT, font=FB, anchor="w"
         )
-        self._bulk_cost_lbl.pack(anchor="w", pady=(2, 12))
+        self._bulk_cost_lbl.pack(anchor="w", pady=(2, 0))
+
+        # Per-section breakdown (equate mode only — empty otherwise).
+        self._bulk_breakdown_lbl = tk.Label(
+            p, text="", bg=BG, fg=MUTED, font=FS, anchor="w"
+        )
+        self._bulk_breakdown_lbl.pack(anchor="w", pady=(0, 12))
+
+        # Configurable cost-confirm threshold. Set high (e.g. 999) to silence
+        # the dialog; set low (e.g. 0) to confirm every run.
+        tr = tk.Frame(p, bg=BG); tr.pack(anchor="w", pady=(0, 12))
+        tk.Label(tr, text="Confirm above: $", bg=BG, fg=MUTED, font=FS
+                 ).pack(side="left")
+        self._bulk_threshold_var = tk.StringVar(
+            value=f"{float(self.settings.get('bulk_cost_confirm_threshold') or BULK_COST_CONFIRM_THRESHOLD):.2f}"
+        )
+        threshold_entry = tk.Entry(
+            tr, textvariable=self._bulk_threshold_var,
+            bg=PANEL2, fg=TEXT, font=FS,
+            insertbackground=ACCENT, relief="flat", width=8,
+        )
+        threshold_entry.pack(side="left")
+        threshold_entry.bind("<FocusOut>", lambda _e: self._bulk_threshold_finalised())
+        threshold_entry.bind("<Return>",   lambda _e: self._bulk_threshold_finalised())
+
+        # Live "spent so far" label. Empty unless a bulk run is in progress
+        # (or just finished — _bulk_run_finished hides it then).
+        self._bulk_live_spent_lbl = tk.Label(
+            p, text="", bg=BG, fg=MUTED, font=FS, anchor="w"
+        )
+        self._bulk_live_spent_lbl.pack(anchor="w", pady=(0, 8))
 
         # Action row.
         ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
@@ -537,9 +587,9 @@ class App(tk.Tk):
 
         # Treeview of per-set rows.
         tf = tk.Frame(p, bg=BG); tf.pack(fill="both", expand=True, pady=(8, 0))
-        cols = ("#", "Started", "Subtype", "Status", "Verdict", "Cost", "Difficulty")
+        cols = ("#", "Started", "Section", "Subtype", "Status", "Verdict", "Cost", "Difficulty")
         self._bulk_tree = ttk.Treeview(tf, columns=cols, show="headings", height=10)
-        for c, w in zip(cols, (44, 90, 110, 180, 100, 70, 80)):
+        for c, w in zip(cols, (44, 90, 70, 110, 180, 100, 70, 80)):
             self._bulk_tree.heading(c, text=c)
             self._bulk_tree.column(c, width=w, anchor="w" if c == "Status" else "center")
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self._bulk_tree.yview)
@@ -557,8 +607,58 @@ class App(tk.Tk):
         self._bulk_preview.pack(fill="both", expand=True)
         self._bulk_preview.config(state="disabled")
 
+        # If the user previously left equate ticked, apply the disabled/hidden
+        # state now (the BooleanVar's initial value is set above; this call
+        # propagates it through to the radios and subtype frame).
+        if self._bulk_equate.get():
+            self._bulk_equate_changed()
+
         # Initialise the cost banner.
         self._bulk_inputs_changed()
+
+    def _bulk_equate_changed(self):
+        """Called when the equate checkbox is toggled. Disables the Section
+        radios + hides the Subtype row when on; restores them when off.
+        Persists the setting and triggers a cost-banner refresh."""
+        equate = self._bulk_equate.get()
+        self.settings.set("bulk_equate", equate)
+
+        # Section radios.
+        radio_state = "disabled" if equate else "normal"
+        for rb in self._bulk_section_radios:
+            rb.config(state=radio_state)
+
+        # Subtype row — entirely hidden when equate is on.
+        if equate:
+            self._bulk_subtype_frame.pack_forget()
+        else:
+            # Repack at its original position (between section radios and
+            # quantity row). pack() without `before=` re-appends to the end,
+            # which is fine here because nothing has been packed since.
+            # If the layout changes in future, switch to `before=<next-frame>`.
+            self._bulk_subtype_frame.pack(anchor="w", pady=(0, 10))
+            # When restoring, also force the choices to refresh in case the
+            # current section's catalogue has changed.
+            self._bulk_refresh_subtype_choices()
+
+        self._bulk_inputs_changed()
+
+    def _bulk_threshold_finalised(self):
+        """Validate the cost-confirm threshold entry on focus-out / Return.
+        Reverts to the last good value on invalid input."""
+        raw = self._bulk_threshold_var.get().strip()
+        try:
+            value = float(raw)
+            if value < 0:
+                raise ValueError("threshold must be non-negative")
+        except ValueError:
+            # Revert: read the last good value back into the entry.
+            current = float(self.settings.get("bulk_cost_confirm_threshold")
+                              or BULK_COST_CONFIRM_THRESHOLD)
+            self._bulk_threshold_var.set(f"{current:.2f}")
+            return
+        self.settings.set("bulk_cost_confirm_threshold", value)
+        self._bulk_threshold_var.set(f"{value:.2f}")
 
     def _bulk_section_changed(self):
         """Called when the Section radio changes. Refreshes subtype choices
@@ -611,6 +711,7 @@ class App(tk.Tk):
         settings, and gates the Start button."""
         section = self._bulk_sec.get()
         hint    = self._bulk_hint.get()
+        equate  = self._bulk_equate.get()
 
         # Resolve subtype: combobox stores the human label; we map back to the
         # internal storage value (e.g. 'venn'). 'Any (mixed)' → "" → None.
@@ -631,8 +732,10 @@ class App(tk.Tk):
         self.settings.set("bulk_quantity_unit",
                             "questions" if subtype else "sets")
 
-        # Flip the Quantity label.
-        self._bulk_qty_lbl.config(text=("Questions:" if subtype else "Sets:"))
+        # Flip the Quantity label. In equate mode the label is always "Sets:"
+        # since equate forces subtype to None even if a value is persisted.
+        self._bulk_qty_lbl.config(
+            text=("Sets:" if equate or not subtype else "Questions:"))
 
         # Parse quantity.
         raw = self._bulk_qty.get().strip()
@@ -645,24 +748,35 @@ class App(tk.Tk):
         # Bail if quantity is invalid.
         if n_input is None or n_input < 1:
             self._bulk_yield_lbl.config(text="")
-            max_input = (BULK_MAX_QUANTITY * SET_SIZES.get(section, 5)) if subtype \
-                          else BULK_MAX_QUANTITY
+            if equate:
+                max_input = BULK_MAX_QUANTITY  # per-section cap
+            else:
+                max_input = (BULK_MAX_QUANTITY * SET_SIZES.get(section, 5)) if subtype \
+                              else BULK_MAX_QUANTITY
             self._bulk_cost_lbl.config(
                 text=f"Enter a number 1 - {max_input}.",
                 fg=WARN,
             )
+            self._bulk_breakdown_lbl.config(text="")
             self._bulk_start_btn.config(state="disabled")
             return
 
         # Compute set count and yield helper line.
-        n_sets = compute_set_count(n_input, section, subtype)
         capped = False
-        if n_sets > BULK_MAX_QUANTITY:
-            n_sets = BULK_MAX_QUANTITY
-            capped = True
+        if equate:
+            # Input is per-section count; total n_sets = per_section × 4.
+            per_section = min(n_input, BULK_MAX_QUANTITY)
+            if per_section < n_input:
+                capped = True
+            n_sets = per_section * len(EQUATE_SECTIONS)
+        else:
+            n_sets = compute_set_count(n_input, section, subtype)
+            if n_sets > BULK_MAX_QUANTITY:
+                n_sets = BULK_MAX_QUANTITY
+                capped = True
 
-        # Helper line — only when subtype is set.
-        if subtype:
+        # Helper line — only when subtype is set and equate is off.
+        if subtype and not equate:
             per_set = SET_SIZES[section]
             yielded = n_sets * per_set
             extra = yielded - n_input
@@ -681,12 +795,34 @@ class App(tk.Tk):
         jury    = bool(self.settings.get("multi_judge"))
         low, high = estimate_bulk_cost(n_sets, llm, multi_judge=jury, verify=verify)
 
-        suffix = "  (capped at the max — split into multiple runs for more)" if capped else ""
+        if equate:
+            cap_suffix = ("  (capped at 100 per section — split into multiple "
+                          "runs for more)") if capped else ""
+            descriptor = (f"{n_sets // len(EQUATE_SECTIONS)} sets × "
+                          f"{len(EQUATE_SECTIONS)} sections × {llm}{cap_suffix}")
+        else:
+            cap_suffix = "  (capped at the max — split into multiple runs for more)" \
+                if capped else ""
+            descriptor = f"{n_sets} sets × {llm}{cap_suffix}"
+
         self._bulk_cost_lbl.config(
-            text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   "
-                 f"({n_sets} sets × {llm}{suffix})",
+            text=f"Estimated cost: ~${low:.2f} - ${high:.2f}   ({descriptor})",
             fg=ACCENT,
         )
+
+        # Per-section breakdown (equate mode only).
+        if equate and not capped:
+            per_section = n_sets // len(EQUATE_SECTIONS)
+            parts = []
+            for s in EQUATE_SECTIONS:
+                _l, h = estimate_section_cost(
+                    s, per_section, llm, multi_judge=jury, verify=verify)
+                parts.append(f"{s} ~${h:.2f}")
+            self._bulk_breakdown_lbl.config(
+                text="↳ " + "  ·  ".join(parts),
+            )
+        else:
+            self._bulk_breakdown_lbl.config(text="")
 
         # Don't override "running" state — we re-enable in _bulk_run_finished.
         if self._bulk_thread is None or not self._bulk_thread.is_alive():
@@ -722,17 +858,39 @@ class App(tk.Tk):
         if n_input < 1:
             return
 
-        # Convert questions → sets when subtype is set; cap at the max set count.
-        n = compute_set_count(n_input, section, subtype)
-        n = min(n, BULK_MAX_QUANTITY)
-        if n < 1:
-            return
+        equate = self._bulk_equate.get()
 
-        if self.db.count(section, indexed_only=True) == 0:
-            if not messagebox.askyesno("No Indexed Documents",
-                f"No indexed documents for {SECTIONS[section]}.\n\n"
-                "Add docs and click Index, or generate without RAG context?"):
+        if equate:
+            # Equate: input is sets-per-section, cap is per-section.
+            subtype = None
+            n_per_section = min(n_input, BULK_MAX_QUANTITY)
+            if n_per_section < 1:
                 return
+            n = n_per_section * len(EQUATE_SECTIONS)  # used for cost preview math
+            task_list = equate_task_list(n_per_section)
+
+            # Batched no-RAG dialog: collect every empty section and ask once.
+            empty = [s for s in EQUATE_SECTIONS
+                     if self.db.count(s, indexed_only=True) == 0]
+            if empty:
+                if not messagebox.askyesno(
+                    "No Indexed Documents",
+                    f"No indexed documents for: {', '.join(empty)}.\n\n"
+                    "Add docs and click Index, or generate without RAG context?"):
+                    return
+        else:
+            # Single-section: existing logic (questions → sets when subtype set).
+            n = compute_set_count(n_input, section, subtype)
+            n = min(n, BULK_MAX_QUANTITY)
+            if n < 1:
+                return
+            task_list = [section] * n
+
+            if self.db.count(section, indexed_only=True) == 0:
+                if not messagebox.askyesno("No Indexed Documents",
+                    f"No indexed documents for {SECTIONS[section]}.\n\n"
+                    "Add docs and click Index, or generate without RAG context?"):
+                    return
 
         hint = self._bulk_hint.get()
 
@@ -742,12 +900,19 @@ class App(tk.Tk):
         jury   = bool(self.settings.get("multi_judge"))
         low, high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
 
-        if high > BULK_COST_CONFIRM_THRESHOLD:
+        threshold = float(self.settings.get("bulk_cost_confirm_threshold")
+                            or BULK_COST_CONFIRM_THRESHOLD)
+        if high > threshold:
+            if equate:
+                section_line = (f"Sections: {', '.join(EQUATE_SECTIONS)} "
+                                f"({n // len(EQUATE_SECTIONS)} sets each)")
+            else:
+                section_line = f"Section: {SECTIONS[section]}"
             ok = messagebox.askyesno(
                 "Confirm bulk run",
                 f"Estimated cost: ${low:.2f} - ${high:.2f}\n"
                 f"Sets: {n}\n"
-                f"Section: {SECTIONS[section]}\n"
+                f"{section_line}\n"
                 f"Model: {llm}\n\n"
                 f"Continue?",
             )
@@ -757,10 +922,11 @@ class App(tk.Tk):
         exclude_venn = bool(self._exclude_venn_var.get())
         no_visuals   = bool(self._no_visuals_var.get())
 
+        # task_list was built above (either equate or single-section path).
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
             target=self._bulk_worker,
-            args=(section, hint, n, subtype, exclude_venn, no_visuals),
+            args=(task_list, hint, subtype, exclude_venn, no_visuals),
             daemon=True,
         )
         self._bulk_thread.start()
@@ -813,25 +979,36 @@ class App(tk.Tk):
     def _bulk_row_iid(self, idx: int) -> str:
         return f"bulk-{idx}"
 
-    def _bulk_seed_rows(self, n: int):
-        """Initialise _bulk_rows + Treeview with N queued entries."""
-        section = self._bulk_sec.get()
+    def _bulk_seed_rows(self, task_list: list[str]):
+        """Initialise _bulk_rows + Treeview with one queued entry per task.
+        Each task is the section code for that row (single-section mode passes
+        [section] * n; equate mode passes a round-robin list)."""
         subtype_value = self.settings.get("bulk_subtype") or ""
-        subtype_label = next(
-            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, []) if v == subtype_value),
-            "—",
-        )
+        # Subtype label is per-section; computed once for single-section runs
+        # (all rows share the section). For equate runs subtype is forced None,
+        # so the per-row label is always "—".
         self._bulk_rows = [
             {"idx": i, "status": "queued", "result": None,
-              "error": None, "started": "", "subtype": subtype_value or None}
-            for i in range(1, n + 1)
+              "error": None, "started": "",
+              "section": section,
+              "subtype": subtype_value or None}
+            for i, section in enumerate(task_list, start=1)
         ]
         for iid in self._bulk_tree.get_children():
             self._bulk_tree.delete(iid)
         for r in self._bulk_rows:
+            section = r["section"]
+            subtype_label = next(
+                (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, [])
+                 if v == subtype_value),
+                "—",
+            ) if subtype_value else "—"
+            # Note: Section column isn't added to the Treeview yet — that's
+            # Task 5. For now the row values match the existing 7-column shape.
             self._bulk_tree.insert(
                 "", "end", iid=self._bulk_row_iid(r["idx"]),
-                values=(r["idx"], "", subtype_label, "queued", "—", "—", "—"),
+                values=(r["idx"], "", section, subtype_label,
+                          "queued", "—", "—", "—"),
             )
 
     def _bulk_set_row(self, idx: int, *,
@@ -863,10 +1040,13 @@ class App(tk.Tk):
         else:  # queued
             st_cell = "queued"
 
-        # Subtype cell — derived from the row's stored subtype (set in seed_rows).
+        # Subtype cell — derived from the row's stored subtype + section.
+        # Use the row's own section so equate-mode rows resolve their subtype
+        # against the correct section's catalogue.
         subtype_value = row.get("subtype")
+        row_section   = row.get("section") or self._bulk_sec.get()
         subtype_cell = next(
-            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(self._bulk_sec.get(), [])
+            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(row_section, [])
              if v == subtype_value),
             "—",
         ) if subtype_value else "—"
@@ -903,29 +1083,40 @@ class App(tk.Tk):
 
         self._bulk_tree.item(
             self._bulk_row_iid(idx),
-            values=(idx, row["started"], subtype_cell, st_cell,
+            values=(idx, row["started"],
+                      row.get("section") or "—",
+                      subtype_cell, st_cell,
                       verdict_cell, cost_cell, diff_cell),
         )
 
-    def _bulk_run_started(self, n: int):
+    def _bulk_run_started(self, task_list: list[str]):
+        n = len(task_list)
         self._bulk_started_at = time.perf_counter()
         self._bulk_run_cost   = 0.0
         self._bulk_start_btn.config(state="disabled", text="Generating…")
         self._bulk_stop_btn.config(state="normal")
         self._bulk_progress_lbl.config(text=f"0 / {n}")
-        self._bulk_seed_rows(n)
+        self._bulk_seed_rows(task_list)
         llm    = self.settings.get("llm")
         verify = bool(self.settings.get("verify"))
         jury   = bool(self.settings.get("multi_judge"))
         _, est_high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+        self._bulk_last_estimate_high = est_high
+        self._bulk_update_spent()  # show "Spent: $0.00 / ~$X.XX est (0%)" immediately
+        # Section field reflects the *first* section in the task list — single-
+        # section runs share one section across all rows; equate runs use the
+        # task_list field on the bulk_run_end event instead.
+        equate_mode = bool(self._bulk_equate.get())
         emit("bulk_run_start",
-             section=self._bulk_sec.get(),
+             section=task_list[0] if task_list else self._bulk_sec.get(),
              n=n,
              model=llm,
              verify=verify,
              multi_judge=jury,
              estimated_cost_high=round(est_high, 4),
-             subtype=(self.settings.get("bulk_subtype") or None))
+             subtype=(self.settings.get("bulk_subtype") or None),
+             equate_mode=equate_mode,
+             task_list_length=len(task_list))
 
     def _bulk_run_finished(self, succeeded: int, failed: int, stopped: bool = False):
         n = len(self._bulk_rows)
@@ -942,23 +1133,31 @@ class App(tk.Tk):
              failed=failed,
              stopped=stopped,
              actual_cost_usd=round(self._bulk_run_cost, 4),
+             estimated_cost_high=round(self._bulk_last_estimate_high, 4),
              duration_s=round(elapsed, 1),
              subtype=(self.settings.get("bulk_subtype") or None),
-             drift_count=drift_count)
+             drift_count=drift_count,
+             equate_mode=bool(self._bulk_equate.get()))
         self._bulk_thread = None
         self._bulk_started_at = None
         self._bulk_start_btn.config(state="normal", text="⚡  START BULK RUN")
         self._bulk_stop_btn.config(state="disabled")
+        actual = self._bulk_run_cost
+        est    = self._bulk_last_estimate_high or 0.0
+        cost_tail = f"  Actual: ${actual:.2f} (est ${est:.2f})"
         if stopped:
-            tail = f"Stopped at {succeeded + failed} / {n}."
+            done_count = succeeded + failed
+            tail = f"Stopped at {done_count} / {n} sets.{cost_tail}"
         else:
             drift_note = f" ({drift_count} with subtype drift)" if drift_count else ""
             tail = f"Bulk run finished: {succeeded} succeeded{drift_note}, {failed} failed"
             if skipped: tail += f", {skipped} skipped"
             tail += "."
+            tail += cost_tail
         self._bulk_progress_lbl.config(text=tail)
         self._status(tail)
         self._bulk_inputs_changed()  # re-evaluate Start button against new state
+        self._bulk_live_spent_lbl.config(text="")
 
     def _bulk_verify_complete(self, idx: int, update: Dict[str, Any]):
         """Main-thread; merges async-verify outcome into a bulk row that already
@@ -987,8 +1186,21 @@ class App(tk.Tk):
         self._session_tokens["cache_w"] += vu.get("cache_creation_input_tokens", 0) or 0
         tot = sum(self._session_tokens.values())
         self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._bulk_update_spent()
         self._refresh_stats()
         self._refresh_insights()
+
+    def _bulk_update_spent(self):
+        """Refresh the live-spent label. No-op if no run is active."""
+        if self._bulk_thread is None or not self._bulk_thread.is_alive():
+            self._bulk_live_spent_lbl.config(text="")
+            return
+        spent    = self._bulk_run_cost
+        est_high = self._bulk_last_estimate_high or 0.0
+        pct = int(round(100 * spent / est_high)) if est_high > 0 else 0
+        self._bulk_live_spent_lbl.config(
+            text=f"Spent: ${spent:.2f} / ~${est_high:.2f} est ({pct}%)",
+        )
 
     def _bulk_after_success(self, idx: int, result: Dict[str, Any]):
         """Main-thread; updates row + global session counters + History."""
@@ -1002,18 +1214,20 @@ class App(tk.Tk):
         self._session_tokens["cache_w"] += usage.get("cache_creation_input_tokens", 0) or 0
         tot = sum(self._session_tokens.values())
         self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._bulk_update_spent()
         self._refresh_stats()
         self._refresh_out()
         self._refresh_insights()
 
-    def _bulk_worker(self, section: str, hint: str, n: int,
+    def _bulk_worker(self, task_list: list[str], hint: str,
                        subtype: Optional[str],
                        exclude_venn: bool = False,
                        no_visuals: bool = False):
-        self.after(0, lambda: self._bulk_run_started(n))
+        n = len(task_list)
+        self.after(0, lambda: self._bulk_run_started(task_list))
         succeeded = 0
         failed    = 0
-        for i in range(1, n + 1):
+        for i, section in enumerate(task_list, start=1):
             if self._bulk_stop.is_set():
                 # Mark this and every later row as skipped, then exit.
                 for j in range(i, n + 1):

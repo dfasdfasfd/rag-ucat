@@ -156,6 +156,30 @@ def compute_set_count(n_input: int, section: str,
     per_set = SET_SIZES.get(section, 1) or 1
     return math.ceil(n_input / per_set)
 
+
+# ─── Bulk equate mode ────────────────────────────────────────────────────────
+
+# The four sections that participate in equate mode. AR is intentionally
+# excluded — it's pattern-matching, not directly comparable to the four
+# reasoning sections, and a balanced UCAT mock typically pairs the reasoning
+# sections together. Order is the round-robin order used by equate_task_list.
+EQUATE_SECTIONS: tuple[str, ...] = ("VR", "QR", "SJT", "DM")
+
+
+def equate_task_list(n: int) -> list[str]:
+    """Round-robin section list for an equate run.
+
+    n=0 → []
+    n=1 → ["VR", "QR", "SJT", "DM"]
+    n=3 → ["VR", "QR", "SJT", "DM", "VR", "QR", "SJT", "DM", "VR", "QR", "SJT", "DM"]
+
+    Returns an empty list for non-positive n.
+    """
+    if n <= 0:
+        return []
+    return list(EQUATE_SECTIONS) * n
+
+
 # IRT difficulty bands (Rasch logits). Predicted by Claude per question;
 # refined when student response data accumulates.
 IRT_BANDS = {
@@ -209,6 +233,9 @@ class Settings:
         # ── Generation toggles (added 2026-04-28) ──────────────────────────
         "exclude_venn":            False,  # DM mixed sets skip Venn subtype
         "no_visuals":              False,  # hide visuals panel + suppress visual-only DM venn
+        # ── Equate mode + configurable confirm threshold (added 2026-04-28) ─
+        "bulk_equate":                  False,   # tick to run VR/QR/SJT/DM together
+        "bulk_cost_confirm_threshold":  5.00,    # USD; overrides BULK_COST_CONFIRM_THRESHOLD
     }
 
     def __init__(self, path: str = SETTINGS_FILE):
@@ -271,6 +298,24 @@ def api_status() -> tuple[bool, str]:
 
 # ─── Bulk cost estimator ──────────────────────────────────────────────────────
 
+# Per-section cost multipliers, normalised to mean 1.0 across EQUATE_SECTIONS
+# so that sum across the four equate sections is exactly 4.0 (i.e. 4× the
+# flat baseline). These are educated guesses based on prompt structure:
+#   - VR  carries a passage (200-300 words) + 4 short questions
+#   - QR  carries a chart spec (table/bar/line/etc.) + 4 numerical questions
+#         — chart spec adds output tokens, hence the bump above 1.0
+#   - SJT carries a workplace scenario + 4 Likert items — short, hence below 1.0
+#   - DM  carries 5 standalone items — used as the baseline (1.0)
+# Refine via telemetry in a follow-up spec.
+SECTION_COST_MULTIPLIERS: dict[str, float] = {
+    "VR":  0.95,
+    "QR":  1.20,
+    "SJT": 0.85,
+    "DM":  1.00,
+    "AR":  1.10,   # not in EQUATE_SECTIONS today, included for forward-compat
+}
+
+
 def estimate_bulk_cost(
     n: int,
     llm: str,
@@ -313,3 +358,22 @@ def estimate_bulk_cost(
         per_high += jury_per
 
     return n * per_low, n * per_high
+
+
+def estimate_section_cost(
+    section: str,
+    n_sets: int,
+    llm: str,
+    *,
+    multi_judge: bool,
+    verify: bool,
+) -> tuple[float, float]:
+    """Per-section cost estimate. Wraps ``estimate_bulk_cost`` and applies the
+    section-specific multiplier from ``SECTION_COST_MULTIPLIERS``.
+
+    Sections outside the table fall back to multiplier 1.0.
+    """
+    low, high = estimate_bulk_cost(
+        n_sets, llm, multi_judge=multi_judge, verify=verify)
+    m = SECTION_COST_MULTIPLIERS.get(section, 1.0)
+    return low * m, high * m
