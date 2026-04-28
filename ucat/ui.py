@@ -683,9 +683,14 @@ class App(tk.Tk):
             if not ok:
                 return
 
+        # Build the task list. Single-section mode = [section] * n; equate
+        # mode (added in a later task) will branch here to call
+        # equate_task_list(n) instead.
+        task_list = [section] * n
+
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
-            target=self._bulk_worker, args=(section, hint, n, subtype), daemon=True
+            target=self._bulk_worker, args=(task_list, hint, subtype), daemon=True
         )
         self._bulk_thread.start()
 
@@ -737,22 +742,32 @@ class App(tk.Tk):
     def _bulk_row_iid(self, idx: int) -> str:
         return f"bulk-{idx}"
 
-    def _bulk_seed_rows(self, n: int):
-        """Initialise _bulk_rows + Treeview with N queued entries."""
-        section = self._bulk_sec.get()
+    def _bulk_seed_rows(self, task_list: list[str]):
+        """Initialise _bulk_rows + Treeview with one queued entry per task.
+        Each task is the section code for that row (single-section mode passes
+        [section] * n; equate mode passes a round-robin list)."""
         subtype_value = self.settings.get("bulk_subtype") or ""
-        subtype_label = next(
-            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, []) if v == subtype_value),
-            "—",
-        )
+        # Subtype label is per-section; computed once for single-section runs
+        # (all rows share the section). For equate runs subtype is forced None,
+        # so the per-row label is always "—".
         self._bulk_rows = [
             {"idx": i, "status": "queued", "result": None,
-              "error": None, "started": "", "subtype": subtype_value or None}
-            for i in range(1, n + 1)
+              "error": None, "started": "",
+              "section": section,
+              "subtype": subtype_value or None}
+            for i, section in enumerate(task_list, start=1)
         ]
         for iid in self._bulk_tree.get_children():
             self._bulk_tree.delete(iid)
         for r in self._bulk_rows:
+            section = r["section"]
+            subtype_label = next(
+                (lbl for v, lbl in SUBTYPES_BY_SECTION.get(section, [])
+                 if v == subtype_value),
+                "—",
+            ) if subtype_value else "—"
+            # Note: Section column isn't added to the Treeview yet — that's
+            # Task 5. For now the row values match the existing 7-column shape.
             self._bulk_tree.insert(
                 "", "end", iid=self._bulk_row_iid(r["idx"]),
                 values=(r["idx"], "", subtype_label, "queued", "—", "—", "—"),
@@ -787,10 +802,13 @@ class App(tk.Tk):
         else:  # queued
             st_cell = "queued"
 
-        # Subtype cell — derived from the row's stored subtype (set in seed_rows).
+        # Subtype cell — derived from the row's stored subtype + section.
+        # Use the row's own section so equate-mode rows resolve their subtype
+        # against the correct section's catalogue.
         subtype_value = row.get("subtype")
+        row_section   = row.get("section") or self._bulk_sec.get()
         subtype_cell = next(
-            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(self._bulk_sec.get(), [])
+            (lbl for v, lbl in SUBTYPES_BY_SECTION.get(row_section, [])
              if v == subtype_value),
             "—",
         ) if subtype_value else "—"
@@ -831,19 +849,23 @@ class App(tk.Tk):
                       verdict_cell, cost_cell, diff_cell),
         )
 
-    def _bulk_run_started(self, n: int):
+    def _bulk_run_started(self, task_list: list[str]):
+        n = len(task_list)
         self._bulk_started_at = time.perf_counter()
         self._bulk_run_cost   = 0.0
         self._bulk_start_btn.config(state="disabled", text="Generating…")
         self._bulk_stop_btn.config(state="normal")
         self._bulk_progress_lbl.config(text=f"0 / {n}")
-        self._bulk_seed_rows(n)
+        self._bulk_seed_rows(task_list)
         llm    = self.settings.get("llm")
         verify = bool(self.settings.get("verify"))
         jury   = bool(self.settings.get("multi_judge"))
         _, est_high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+        # Section field reflects the *first* section in the task list — single-
+        # section runs share one section across all rows; equate runs use the
+        # task_list field on the bulk_run_end event instead.
         emit("bulk_run_start",
-             section=self._bulk_sec.get(),
+             section=task_list[0] if task_list else self._bulk_sec.get(),
              n=n,
              model=llm,
              verify=verify,
@@ -930,12 +952,13 @@ class App(tk.Tk):
         self._refresh_out()
         self._refresh_insights()
 
-    def _bulk_worker(self, section: str, hint: str, n: int,
+    def _bulk_worker(self, task_list: list[str], hint: str,
                        subtype: Optional[str]):
-        self.after(0, lambda: self._bulk_run_started(n))
+        n = len(task_list)
+        self.after(0, lambda: self._bulk_run_started(task_list))
         succeeded = 0
         failed    = 0
-        for i in range(1, n + 1):
+        for i, section in enumerate(task_list, start=1):
             if self._bulk_stop.is_set():
                 # Mark this and every later row as skipped, then exit.
                 for j in range(i, n + 1):
