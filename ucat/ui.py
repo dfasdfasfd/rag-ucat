@@ -127,6 +127,7 @@ class App(tk.Tk):
         self._bulk_rows: List[Dict[str, Any]] = []
         self._bulk_started_at: Optional[float] = None
         self._bulk_run_cost: float = 0.0  # accumulated USD for the active run
+        self._bulk_last_estimate_high: float = 0.0  # cost-banner upper bound at run start
 
         self._style()
         self._ui()
@@ -500,6 +501,13 @@ class App(tk.Tk):
         threshold_entry.pack(side="left")
         threshold_entry.bind("<FocusOut>", lambda _e: self._bulk_threshold_finalised())
         threshold_entry.bind("<Return>",   lambda _e: self._bulk_threshold_finalised())
+
+        # Live "spent so far" label. Empty unless a bulk run is in progress
+        # (or just finished — _bulk_run_finished hides it then).
+        self._bulk_live_spent_lbl = tk.Label(
+            p, text="", bg=BG, fg=MUTED, font=FS, anchor="w"
+        )
+        self._bulk_live_spent_lbl.pack(anchor="w", pady=(0, 8))
 
         # Action row.
         ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
@@ -1017,6 +1025,8 @@ class App(tk.Tk):
         verify = bool(self.settings.get("verify"))
         jury   = bool(self.settings.get("multi_judge"))
         _, est_high = estimate_bulk_cost(n, llm, multi_judge=jury, verify=verify)
+        self._bulk_last_estimate_high = est_high
+        self._bulk_update_spent()  # show "Spent: $0.00 / ~$X.XX est (0%)" immediately
         # Section field reflects the *first* section in the task list — single-
         # section runs share one section across all rows; equate runs use the
         # task_list field on the bulk_run_end event instead.
@@ -1061,6 +1071,7 @@ class App(tk.Tk):
         self._bulk_progress_lbl.config(text=tail)
         self._status(tail)
         self._bulk_inputs_changed()  # re-evaluate Start button against new state
+        self._bulk_live_spent_lbl.config(text="")
 
     def _bulk_verify_complete(self, idx: int, update: Dict[str, Any]):
         """Main-thread; merges async-verify outcome into a bulk row that already
@@ -1089,8 +1100,21 @@ class App(tk.Tk):
         self._session_tokens["cache_w"] += vu.get("cache_creation_input_tokens", 0) or 0
         tot = sum(self._session_tokens.values())
         self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._bulk_update_spent()
         self._refresh_stats()
         self._refresh_insights()
+
+    def _bulk_update_spent(self):
+        """Refresh the live-spent label. No-op if no run is active."""
+        if self._bulk_thread is None or not self._bulk_thread.is_alive():
+            self._bulk_live_spent_lbl.config(text="")
+            return
+        spent    = self._bulk_run_cost
+        est_high = self._bulk_last_estimate_high or 0.0
+        pct = int(round(100 * spent / est_high)) if est_high > 0 else 0
+        self._bulk_live_spent_lbl.config(
+            text=f"Spent: ${spent:.2f} / ~${est_high:.2f} est ({pct}%)",
+        )
 
     def _bulk_after_success(self, idx: int, result: Dict[str, Any]):
         """Main-thread; updates row + global session counters + History."""
@@ -1104,6 +1128,7 @@ class App(tk.Tk):
         self._session_tokens["cache_w"] += usage.get("cache_creation_input_tokens", 0) or 0
         tot = sum(self._session_tokens.values())
         self._cost_lbl.config(text=f"${self._session_cost:.3f} · {tot:,} tok")
+        self._bulk_update_spent()
         self._refresh_stats()
         self._refresh_out()
         self._refresh_insights()
