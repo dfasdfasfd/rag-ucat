@@ -476,9 +476,9 @@ class App(tk.Tk):
 
         # Treeview of per-set rows.
         tf = tk.Frame(p, bg=BG); tf.pack(fill="both", expand=True, pady=(8, 0))
-        cols = ("#", "Started", "Subtype", "Status", "Verdict", "Cost", "Difficulty")
+        cols = ("#", "Started", "Section", "Subtype", "Status", "Verdict", "Cost", "Difficulty")
         self._bulk_tree = ttk.Treeview(tf, columns=cols, show="headings", height=10)
-        for c, w in zip(cols, (44, 90, 110, 180, 100, 70, 80)):
+        for c, w in zip(cols, (44, 90, 70, 110, 180, 100, 70, 80)):
             self._bulk_tree.heading(c, text=c)
             self._bulk_tree.column(c, width=w, anchor="w" if c == "Status" else "center")
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self._bulk_tree.yview)
@@ -770,7 +770,8 @@ class App(tk.Tk):
             # Task 5. For now the row values match the existing 7-column shape.
             self._bulk_tree.insert(
                 "", "end", iid=self._bulk_row_iid(r["idx"]),
-                values=(r["idx"], "", subtype_label, "queued", "—", "—", "—"),
+                values=(r["idx"], "", section, subtype_label,
+                          "queued", "—", "—", "—"),
             )
 
     def _bulk_set_row(self, idx: int, *,
@@ -845,7 +846,9 @@ class App(tk.Tk):
 
         self._bulk_tree.item(
             self._bulk_row_iid(idx),
-            values=(idx, row["started"], subtype_cell, st_cell,
+            values=(idx, row["started"],
+                      row.get("section") or "—",
+                      subtype_cell, st_cell,
                       verdict_cell, cost_cell, diff_cell),
         )
 
