@@ -1030,6 +1030,7 @@ class App(tk.Tk):
         # Section field reflects the *first* section in the task list — single-
         # section runs share one section across all rows; equate runs use the
         # task_list field on the bulk_run_end event instead.
+        equate_mode = bool(self._bulk_equate.get())
         emit("bulk_run_start",
              section=task_list[0] if task_list else self._bulk_sec.get(),
              n=n,
@@ -1037,7 +1038,9 @@ class App(tk.Tk):
              verify=verify,
              multi_judge=jury,
              estimated_cost_high=round(est_high, 4),
-             subtype=(self.settings.get("bulk_subtype") or None))
+             subtype=(self.settings.get("bulk_subtype") or None),
+             equate_mode=equate_mode,
+             task_list_length=len(task_list))
 
     def _bulk_run_finished(self, succeeded: int, failed: int, stopped: bool = False):
         n = len(self._bulk_rows)
@@ -1054,9 +1057,11 @@ class App(tk.Tk):
              failed=failed,
              stopped=stopped,
              actual_cost_usd=round(self._bulk_run_cost, 4),
+             estimated_cost_high=round(self._bulk_last_estimate_high, 4),
              duration_s=round(elapsed, 1),
              subtype=(self.settings.get("bulk_subtype") or None),
-             drift_count=drift_count)
+             drift_count=drift_count,
+             equate_mode=bool(self._bulk_equate.get()))
         self._bulk_thread = None
         self._bulk_started_at = None
         self._bulk_start_btn.config(state="normal", text="⚡  START BULK RUN")
