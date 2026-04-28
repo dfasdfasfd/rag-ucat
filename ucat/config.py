@@ -206,6 +206,9 @@ class Settings:
             "VR": "", "DM": "", "QR": "", "AR": "", "SJT": "",
         },
         "bulk_quantity_unit":      "sets",  # "sets" or "questions" (derived from subtype)
+        # ── Generation toggles (added 2026-04-28) ──────────────────────────
+        "exclude_venn":            False,  # DM mixed sets skip Venn subtype
+        "no_visuals":              False,  # hide visuals panel + suppress visual-only DM venn
     }
 
     def __init__(self, path: str = SETTINGS_FILE):

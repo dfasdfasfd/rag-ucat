@@ -174,7 +174,9 @@ class RAGEngine:
 
     def _system_blocks(self, section: str, retrieved: list,
                         target_difficulty: float,
-                        subtype: Optional[str] = None) -> List[Dict[str, Any]]:
+                        subtype: Optional[str] = None,
+                        exclude_venn: bool = False,
+                        no_visuals: bool = False) -> List[Dict[str, Any]]:
         """Build cache-friendly system blocks.
 
           [0] Frozen role + structural description           (CACHED — stable)
@@ -306,7 +308,20 @@ class RAGEngine:
                 )
 
         if section == "DM":
-            if subtype:
+            # `no_visuals` implies exclude_venn for DM — Venn questions need a
+            # diagram to be answerable, so dropping visuals drops Venn too.
+            drop_venn = exclude_venn or no_visuals
+            if subtype == "venn" and drop_venn:
+                # UI should prevent this combo, but if it slips through, fall
+                # back to text-described set-relationship questions rather
+                # than crashing or producing diagrams.
+                role += (
+                    "\nAll 5 questions MUST be set-relationship questions described "
+                    "ENTIRELY IN TEXT (no diagrams, no `venn` field — leave `venn` null). "
+                    "Use prose like '60 surveyed; 28 swim, 25 do yoga…' so the student "
+                    "can solve via inclusion-exclusion without a chart.\n"
+                )
+            elif subtype:
                 # Subtype override: replace the variety guidance with a lock-in.
                 reminders = {
                     "venn":        "Every question must include a structured `venn` field with 2 or 3 sets.",
@@ -319,6 +334,18 @@ class RAGEngine:
                     f"\nAll 5 questions MUST be {subtype} type. "
                     f"Set `type: '{subtype}'` on every question.\n"
                     f"{reminders.get(subtype, '')}\n"
+                )
+            elif drop_venn:
+                # Mixed-subtype DM but Venn excluded: 5 questions across the
+                # 4 remaining types, one duplicate allowed.
+                reason = "no-visuals mode" if no_visuals else "user-requested exclusion"
+                role += (
+                    f"\nDO NOT generate any venn-type DM questions ({reason}). "
+                    "Leave the `venn` field null on every question.\n"
+                    "Generate exactly 5 questions drawn ONLY from these subtypes: "
+                    "syllogism, logical, probability, argument. With 4 allowed types "
+                    "and 5 questions, repeat at most one type. Do NOT cluster on "
+                    "syllogism — coverage checks flag any subtype appearing 4+ times.\n"
                 )
             else:
                 role += (
@@ -376,6 +403,8 @@ class RAGEngine:
         hint: str = "",
         *,
         subtype: Optional[str] = None,
+        exclude_venn: bool = False,
+        no_visuals: bool = False,
         on_progress: Optional[Callable[[str], None]] = None,
         on_delta: Optional[Callable[[str], None]] = None,
         on_verify_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -400,7 +429,9 @@ class RAGEngine:
                    verify=self.verify_enabled,
                    multi_judge=self.multi_judge,
                    async_verify=async_verify,
-                   subtype=subtype) as t:
+                   subtype=subtype,
+                   exclude_venn=exclude_venn,
+                   no_visuals=no_visuals) as t:
 
             if on_progress: on_progress("Embedding retrieval query…")
             qvec, retrieved = self.retrieve(
@@ -409,7 +440,9 @@ class RAGEngine:
 
             if on_progress: on_progress(f"Retrieved {len(retrieved)} doc(s). Building prompt…")
             system_blocks = self._system_blocks(section, retrieved, target,
-                                                  subtype=subtype)
+                                                  subtype=subtype,
+                                                  exclude_venn=exclude_venn,
+                                                  no_visuals=no_visuals)
 
             user_parts = [f"Generate a NEW UCAT {SECTIONS[section]} question set. "]
             if hint.strip():

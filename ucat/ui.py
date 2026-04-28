@@ -127,9 +127,43 @@ class App(tk.Tk):
         self._bulk_started_at: Optional[float] = None
         self._bulk_run_cost: float = 0.0  # accumulated USD for the active run
 
+        # Generation toggles shared between Generate and Bulk tabs. One
+        # BooleanVar each so ticking the box on either tab updates the
+        # other, and `trace_add` persists the change to settings.
+        self._exclude_venn_var = tk.BooleanVar(
+            value=bool(self.settings.get("exclude_venn"))
+        )
+        self._exclude_venn_var.trace_add("write", self._on_exclude_venn_changed)
+        self._no_visuals_var = tk.BooleanVar(
+            value=bool(self.settings.get("no_visuals"))
+        )
+        self._no_visuals_var.trace_add("write", self._on_no_visuals_changed)
+
         self._style()
         self._ui()
         self.after(700, self._chk_api)
+
+    def _on_exclude_venn_changed(self, *_):
+        """Persist the toggle and refresh the bulk subtype dropdown so the
+        Venn entry appears or disappears correctly."""
+        self.settings.set("exclude_venn", self._exclude_venn_var.get())
+        if hasattr(self, "_bulk_subtype_cb"):
+            self._bulk_refresh_subtype_choices()
+
+    def _on_no_visuals_changed(self, *_):
+        """Persist the toggle, repaint the visuals panel, and refresh the
+        bulk subtype dropdown (no-visuals implies excluding Venn)."""
+        self.settings.set("no_visuals", self._no_visuals_var.get())
+        if hasattr(self, "_visuals"):
+            if self._no_visuals_var.get():
+                self._clear_visuals()
+                tk.Label(self._visuals.inner,
+                          text="(visuals disabled — untick 'No visuals' to render)",
+                          bg=PANEL2, fg=MUTED, font=FS).pack(padx=10, pady=10)
+            elif self._last_data is not None:
+                self._render_visuals(self._last_data)
+        if hasattr(self, "_bulk_subtype_cb"):
+            self._bulk_refresh_subtype_choices()
 
     def _style(self):
         s = ttk.Style(self)
@@ -332,6 +366,19 @@ class App(tk.Tk):
         tk.Label(hr, text="(steers retrieval — e.g. 'percentage change', 'syllogisms', 'ecology')",
                  bg=BG, fg=MUTED, font=FS).pack(side="left", padx=10)
 
+        # Toggle row — Exclude Venn (DM only) + No visuals.
+        tr = tk.Frame(p, bg=BG); tr.pack(anchor="w", pady=(0, 10))
+        tk.Checkbutton(
+            tr, text="Exclude Venn (DM only)", variable=self._exclude_venn_var,
+            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+            activeforeground=ACCENT, font=FS, relief="flat", cursor="hand2",
+        ).pack(side="left", padx=(0, 14))
+        tk.Checkbutton(
+            tr, text="No visuals", variable=self._no_visuals_var,
+            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+            activeforeground=ACCENT, font=FS, relief="flat", cursor="hand2",
+        ).pack(side="left")
+
         ar = tk.Frame(p, bg=BG); ar.pack(anchor="w", pady=(0, 10))
         self._gbtn  = mkbtn(ar, "⚡  GENERATE QUESTIONS", self._do_gen,
                              padx=26, pady=10, font=("Courier New", 12, "bold"))
@@ -431,6 +478,20 @@ class App(tk.Tk):
         # Initial population uses the current section.
         self._bulk_refresh_subtype_choices()
 
+        # Toggle row — Exclude Venn (DM only) + No visuals. Shared
+        # BooleanVars with the Generate tab.
+        btr = tk.Frame(p, bg=BG); btr.pack(anchor="w", pady=(0, 10))
+        tk.Checkbutton(
+            btr, text="Exclude Venn (DM only)", variable=self._exclude_venn_var,
+            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+            activeforeground=ACCENT, font=FS, relief="flat", cursor="hand2",
+        ).pack(side="left", padx=(0, 14))
+        tk.Checkbutton(
+            btr, text="No visuals", variable=self._no_visuals_var,
+            bg=BG, fg=TEXT, selectcolor=PANEL, activebackground=BG,
+            activeforeground=ACCENT, font=FS, relief="flat", cursor="hand2",
+        ).pack(side="left")
+
         # Quantity + topic hint row.
         qr = tk.Frame(p, bg=BG); qr.pack(fill="x", pady=(0, 10))
         self._bulk_qty_lbl = tk.Label(qr, text="Sets:", bg=BG, fg=MUTED, font=FM)
@@ -511,6 +572,15 @@ class App(tk.Tk):
         section = self._bulk_sec.get()
         entries = SUBTYPES_BY_SECTION.get(section, [])
 
+        # Drop the Venn entry from the DM dropdown when the user has
+        # excluded venn (or is in no-visuals mode, which implies it).
+        drop_venn = (
+            section == "DM"
+            and (self._exclude_venn_var.get() or self._no_visuals_var.get())
+        )
+        if drop_venn:
+            entries = [(v, lbl) for v, lbl in entries if v != "venn"]
+
         # Build the displayed list: "Any (mixed)" always first, then human labels.
         labels = ["Any (mixed)"] + [lbl for _v, lbl in entries]
         self._bulk_subtype_cb.config(values=labels)
@@ -522,10 +592,11 @@ class App(tk.Tk):
             return
         self._bulk_subtype_cb.config(state="readonly")
 
-        # Restore last-used subtype for this section.
+        # Restore last-used subtype for this section. If the stored choice
+        # is now hidden (venn while excluded), fall back to "Any (mixed)".
         by_section = self.settings.get("bulk_subtype_by_section") or {}
         stored_value = by_section.get(section, "")
-        if stored_value:
+        if stored_value and any(v == stored_value for v, _ in entries):
             stored_label = next(
                 (lbl for v, lbl in entries if v == stored_value),
                 "Any (mixed)",
@@ -683,9 +754,14 @@ class App(tk.Tk):
             if not ok:
                 return
 
+        exclude_venn = bool(self._exclude_venn_var.get())
+        no_visuals   = bool(self._no_visuals_var.get())
+
         self._bulk_stop.clear()
         self._bulk_thread = threading.Thread(
-            target=self._bulk_worker, args=(section, hint, n, subtype), daemon=True
+            target=self._bulk_worker,
+            args=(section, hint, n, subtype, exclude_venn, no_visuals),
+            daemon=True,
         )
         self._bulk_thread.start()
 
@@ -931,7 +1007,9 @@ class App(tk.Tk):
         self._refresh_insights()
 
     def _bulk_worker(self, section: str, hint: str, n: int,
-                       subtype: Optional[str]):
+                       subtype: Optional[str],
+                       exclude_venn: bool = False,
+                       no_visuals: bool = False):
         self.after(0, lambda: self._bulk_run_started(n))
         succeeded = 0
         failed    = 0
@@ -962,6 +1040,8 @@ class App(tk.Tk):
                     result = self.rag.generate(
                         section, hint,
                         subtype=subtype,
+                        exclude_venn=exclude_venn,
+                        no_visuals=no_visuals,
                         on_progress=lambda m, idx=i: self.after(0, lambda msg=m, _i=idx:
                             self._bulk_set_row(_i, status="running", progress=msg)),
                         on_delta=None,
@@ -1185,10 +1265,15 @@ class App(tk.Tk):
         stats = self.db.coverage_stats(section, last_n=200)
         diversify = pick_diversification(stats, section) or {}
 
+        exclude_venn = bool(self._exclude_venn_var.get())
+        no_visuals   = bool(self._no_visuals_var.get())
+
         def worker():
             try:
                 result = self.rag.generate(
                     section, hint,
+                    exclude_venn=exclude_venn,
+                    no_visuals=no_visuals,
                     on_progress=lambda m: self.after(0, lambda msg=m: self._gprog.config(text=f"⟳  {msg}")),
                     on_delta=on_delta,
                     on_verify_complete=lambda upd: self.after(
@@ -1362,6 +1447,11 @@ class App(tk.Tk):
 
     def _render_visuals(self, data: Dict[str, Any]):
         self._clear_visuals()
+        if self._no_visuals_var.get():
+            tk.Label(self._visuals.inner,
+                      text="(visuals disabled — untick 'No visuals' to render)",
+                      bg=PANEL2, fg=MUTED, font=FS).pack(padx=10, pady=10)
+            return
         if not _HAS_PIL:
             tk.Label(self._visuals.inner,
                       text="(install Pillow for visuals)",
